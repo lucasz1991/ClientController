@@ -908,15 +908,35 @@ fn register_node_remote_internal(app: &tauri::AppHandle, node_name: Option<Strin
         ));
     }
 
-    if let Some(api_key) = body
+    let api_key = body
         .get("node")
         .and_then(|n| n.get("api_key"))
         .and_then(Value::as_str)
-    {
-        cfg.api_key = api_key.to_string();
-        cfg.last_successful_server = cfg.server_domain.clone();
-        save_config(app, &cfg)?;
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "register response did not contain a node api key".to_string())?;
+    cfg.api_key = api_key.to_string();
+    cfg.last_successful_server = cfg.server_domain.clone();
+    save_config(app, &cfg)?;
+    clear_outbox_internal(app)?;
+
+    Ok(true)
+}
+
+fn authentication_failed(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+
+    normalized.contains("http 401")
+        || normalized.contains("http 403")
+        || normalized.contains("unauthorized node")
+        || normalized.contains("invalid node")
+}
+
+fn recover_node_registration(app: &tauri::AppHandle, error: &str) -> Result<bool, String> {
+    if !authentication_failed(error) {
+        return Ok(false);
     }
+
+    register_node_remote_internal(app, None)?;
 
     Ok(true)
 }
@@ -1296,6 +1316,45 @@ fn verify_job_signature(cfg: &ClientConfig, job: &RemoteJob) -> Result<(), Strin
     Ok(())
 }
 
+fn clear_outbox_internal(app: &tauri::AppHandle) -> Result<usize, String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+
+    conn.execute("DELETE FROM outbox_events", [])
+        .map_err(|e| format!("clear outbox failed: {e}"))
+}
+
+fn pending_outbox_internal(app: &tauri::AppHandle, limit: i64) -> Result<Vec<OutboxEvent>, String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, event_type, payload_json, created_at
+             FROM outbox_events
+             WHERE status = 'pending'
+             ORDER BY id ASC
+             LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare outbox query failed: {e}"))?;
+    let rows = stmt
+        .query_map(params![limit.max(1)], |row| {
+            Ok(OutboxEvent {
+                id: row.get(0)?,
+                event_type: row.get(1)?,
+                payload_json: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query pending outbox failed: {e}"))?;
+    let mut events = Vec::new();
+
+    for row in rows {
+        events.push(row.map_err(|e| format!("read outbox row failed: {e}"))?);
+    }
+
+    Ok(events)
+}
+
 fn report_job_result_remote(
     app: &tauri::AppHandle,
     job_uuid: &str,
@@ -1458,6 +1517,86 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     ))
 }
 
+fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Value, String> {
+    match job_type {
+        "node_diagnostics" => {
+            let status = get_client_status(app.clone())?;
+            let outbox = pending_outbox_internal(app, 25)?;
+
+            Ok(json!({
+                "ok": true,
+                "statusMessage": "Node-Diagnose wurde erfasst.",
+                "capturedAt": now_iso(),
+                "client": {
+                    "nodeUuid": status.config.node_uuid,
+                    "serverDomain": status.config.server_domain,
+                    "lastSuccessfulServer": status.config.last_successful_server,
+                    "environment": status.config.environment,
+                    "allowServerRebind": status.config.allow_server_rebind,
+                    "pendingEvents": status.pending_events,
+                    "localDevices": status.local_devices,
+                    "adbSource": status.adb_source,
+                    "adbAvailable": status.adb_available,
+                    "nodeAvailable": status.node_available,
+                    "workflowRuntimeAvailable": status.workflow_runtime_available,
+                    "workflowRuntimePath": status.workflow_runtime_path,
+                },
+                "outboxPreview": outbox,
+            }))
+        }
+        "node_outbox_list" => {
+            let events = pending_outbox_internal(app, 200)?;
+
+            Ok(json!({
+                "ok": true,
+                "statusMessage": format!("{} ausstehende Outbox-Eintraege gelesen.", events.len()),
+                "count": events.len(),
+                "events": events,
+                "capturedAt": now_iso(),
+            }))
+        }
+        "node_outbox_clear" => {
+            let deleted = clear_outbox_internal(app)?;
+
+            Ok(json!({
+                "ok": true,
+                "statusMessage": format!("Lokale Outbox geleert: {} Eintraege.", deleted),
+                "deleted": deleted,
+                "completedAt": now_iso(),
+            }))
+        }
+        "node_discover_devices" => {
+            let devices = discover_android_devices_internal(app, true)?;
+
+            Ok(json!({
+                "ok": true,
+                "statusMessage": format!("{} lokale Geraete erkannt.", devices.len()),
+                "count": devices.len(),
+                "devices": devices,
+                "completedAt": now_iso(),
+            }))
+        }
+        "node_sync" => {
+            let devices = discover_android_devices_internal(app, true)?;
+            let synced = sync_devices_remote_internal(app)?;
+            heartbeat_remote_internal(app, "online", Some(json!({
+                "source": "remote-node-sync",
+                "discovered_devices": devices.len(),
+                "synced_devices": synced,
+            })))?;
+
+            Ok(json!({
+                "ok": true,
+                "statusMessage": "Node-Synchronisierung abgeschlossen.",
+                "discoveredDevices": devices.len(),
+                "syncedDevices": synced,
+                "completedAt": now_iso(),
+            }))
+        }
+        _ => Err(format!("unsupported node control job type: {job_type}")),
+    }
+}
+
 fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
     let cfg = match load_or_create_config(&app) {
         Ok(cfg) => cfg,
@@ -1470,6 +1609,9 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
     let execution = verify_job_signature(&cfg, &job).and_then(|_| match job.job_type.as_str() {
         "workflow_task" => execute_workflow_task_job(&app, &job),
         "ping" => Ok(json!({ "ok": true, "statusMessage": "ClientController node is reachable", "at": now_iso() })),
+        "node_diagnostics" | "node_outbox_list" | "node_outbox_clear" | "node_discover_devices" | "node_sync" => {
+            execute_node_control_job(&app, &job.job_type)
+        }
         other => Err(format!("unsupported ClientController job type: {other}")),
     });
 
@@ -1575,8 +1717,31 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
             notes.push(format!("sync:ok({})", count));
         }
         Err(err) => {
-            let _ = queue_local_event(app, "sync_devices_failed", json!({ "error": err.clone() }));
-            notes.push(format!("sync:fail({})", preview_body(&err, 120)));
+            match recover_node_registration(app, &err) {
+                Ok(true) => {
+                    registered = true;
+                    notes.push("register:recovered(unauthorized)".to_string());
+
+                    match sync_devices_remote_internal(app) {
+                        Ok(count) => {
+                            synced_devices = count;
+                            notes.push(format!("sync:retry-ok({})", count));
+                        }
+                        Err(retry_err) => {
+                            let _ = queue_local_event(app, "sync_devices_failed", json!({ "error": retry_err.clone(), "after_reregister": true }));
+                            notes.push(format!("sync:retry-fail({})", preview_body(&retry_err, 120)));
+                        }
+                    }
+                }
+                Ok(false) => {
+                    let _ = queue_local_event(app, "sync_devices_failed", json!({ "error": err.clone() }));
+                    notes.push(format!("sync:fail({})", preview_body(&err, 120)));
+                }
+                Err(register_err) => {
+                    let _ = queue_local_event(app, "register_node_failed", json!({ "error": register_err.clone(), "trigger": err }));
+                    notes.push(format!("register:recovery-fail({})", preview_body(&register_err, 120)));
+                }
+            }
         }
     }
 
@@ -1594,8 +1759,31 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
             notes.push("heartbeat:ok".to_string());
         }
         Err(err) => {
-            let _ = queue_local_event(app, "heartbeat_failed", json!({ "error": err.clone() }));
-            notes.push(format!("heartbeat:fail({})", preview_body(&err, 120)));
+            match recover_node_registration(app, &err) {
+                Ok(true) => {
+                    registered = true;
+                    notes.push("register:recovered-before-heartbeat".to_string());
+
+                    match heartbeat_remote_internal(app, "online", Some(json!({ "source": "autopilot-retry" }))) {
+                        Ok(_) => {
+                            heartbeat_sent = true;
+                            notes.push("heartbeat:retry-ok".to_string());
+                        }
+                        Err(retry_err) => {
+                            let _ = queue_local_event(app, "heartbeat_failed", json!({ "error": retry_err.clone(), "after_reregister": true }));
+                            notes.push(format!("heartbeat:retry-fail({})", preview_body(&retry_err, 120)));
+                        }
+                    }
+                }
+                Ok(false) => {
+                    let _ = queue_local_event(app, "heartbeat_failed", json!({ "error": err.clone() }));
+                    notes.push(format!("heartbeat:fail({})", preview_body(&err, 120)));
+                }
+                Err(register_err) => {
+                    let _ = queue_local_event(app, "register_node_failed", json!({ "error": register_err.clone(), "trigger": err }));
+                    notes.push(format!("register:heartbeat-recovery-fail({})", preview_body(&register_err, 120)));
+                }
+            }
         }
     }
 
@@ -1605,8 +1793,31 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
             notes.push(format!("jobs:ok({})", count));
         }
         Err(err) => {
-            let _ = queue_local_event(app, "pull_jobs_failed", json!({ "error": err.clone() }));
-            notes.push(format!("jobs:fail({})", preview_body(&err, 120)));
+            match recover_node_registration(app, &err) {
+                Ok(true) => {
+                    registered = true;
+                    notes.push("register:recovered-before-jobs".to_string());
+
+                    match pull_and_start_jobs_remote_internal(app) {
+                        Ok(count) => {
+                            jobs_started = count;
+                            notes.push(format!("jobs:retry-ok({})", count));
+                        }
+                        Err(retry_err) => {
+                            let _ = queue_local_event(app, "pull_jobs_failed", json!({ "error": retry_err.clone(), "after_reregister": true }));
+                            notes.push(format!("jobs:retry-fail({})", preview_body(&retry_err, 120)));
+                        }
+                    }
+                }
+                Ok(false) => {
+                    let _ = queue_local_event(app, "pull_jobs_failed", json!({ "error": err.clone() }));
+                    notes.push(format!("jobs:fail({})", preview_body(&err, 120)));
+                }
+                Err(register_err) => {
+                    let _ = queue_local_event(app, "register_node_failed", json!({ "error": register_err.clone(), "trigger": err }));
+                    notes.push(format!("register:jobs-recovery-fail({})", preview_body(&register_err, 120)));
+                }
+            }
         }
     }
 
@@ -1981,4 +2192,18 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authentication_failed;
+
+    #[test]
+    fn detects_node_authentication_failures() {
+        assert!(authentication_failed(
+            "sync-devices failed: HTTP 401 - {\"message\":\"Unauthorized node.\"}"
+        ));
+        assert!(authentication_failed("register failed: HTTP 403 - forbidden"));
+        assert!(!authentication_failed("request failed: connection refused"));
+    }
 }
