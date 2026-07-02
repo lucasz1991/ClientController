@@ -1,23 +1,26 @@
 use chrono::{DateTime, Utc};
+use flate2::read::GzDecoder;
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tauri::Manager;
-use sha2::{Digest, Sha256};
-use flate2::read::GzDecoder;
 use tar::Archive;
+use tauri::Manager;
+use tauri_plugin_updater::UpdaterExt;
 
 const DEFAULT_SERVER_DOMAIN: &str = "https://factory.follow-flow.de";
 const DEFAULT_BOOTSTRAP_API_KEY: &str = "followflow-default-node-key-change-me";
-const GOOGLE_USB_DRIVER_ZIP_URL: &str = "https://dl.google.com/android/repository/latest_usb_driver_windows.zip";
+const GOOGLE_USB_DRIVER_ZIP_URL: &str =
+    "https://dl.google.com/android/repository/latest_usb_driver_windows.zip";
 static WINDOWS_DRIVER_INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static LOCAL_PROCESS_RECOVERY_PERFORMED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -59,6 +62,9 @@ struct ClientStatus {
     node_available: bool,
     workflow_runtime_available: bool,
     workflow_runtime_path: String,
+    app_version: String,
+    running_processes: i64,
+    updater_available: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +110,16 @@ struct SyncSummary {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+struct LocalProcess {
+    id: i64,
+    job_id: Option<String>,
+    job_type: String,
+    status: String,
+    details_json: String,
+    created_at: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct RemoteJob {
     job_uuid: String,
@@ -146,19 +162,19 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         )
     })?;
 
-    for entry in fs::read_dir(src).map_err(|e| {
-        format!(
-            "cannot read directory {}: {}",
-            src.to_string_lossy(),
-            e
-        )
-    })? {
+    for entry in fs::read_dir(src)
+        .map_err(|e| format!("cannot read directory {}: {}", src.to_string_lossy(), e))?
+    {
         let entry = entry.map_err(|e| format!("read_dir entry error: {e}"))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("cannot read file type for {}: {}", src_path.to_string_lossy(), e))?;
+        let file_type = entry.file_type().map_err(|e| {
+            format!(
+                "cannot read file type for {}: {}",
+                src_path.to_string_lossy(),
+                e
+            )
+        })?;
 
         if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
@@ -321,6 +337,20 @@ fn init_db(app: &tauri::AppHandle) -> Result<(), String> {
     )
     .map_err(|e| format!("init db schema failed: {e}"))?;
 
+    if !LOCAL_PROCESS_RECOVERY_PERFORMED.swap(true, Ordering::SeqCst) {
+        conn.execute(
+            "UPDATE job_executions_local
+             SET status = 'interrupted', details_json = ?1
+             WHERE status = 'running'",
+            params![json!({
+                "statusMessage": "ClientController wurde während des Prozesses neu gestartet.",
+                "recoveredAt": now_iso(),
+            })
+            .to_string()],
+        )
+        .map_err(|e| format!("recover interrupted local processes failed: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -389,7 +419,11 @@ fn http_client() -> Result<Client, String> {
         .map_err(|e| format!("http client init failed: {e}"))
 }
 
-fn queue_local_event(app: &tauri::AppHandle, event_type: &str, payload: Value) -> Result<(), String> {
+fn queue_local_event(
+    app: &tauri::AppHandle,
+    event_type: &str,
+    payload: Value,
+) -> Result<(), String> {
     init_db(app)?;
     let conn = open_db(app)?;
     let payload_json =
@@ -674,8 +708,7 @@ fn ensure_windows_google_usb_driver_available(app: &tauri::AppHandle) -> Result<
     if extract_root.exists() {
         let _ = fs::remove_dir_all(&extract_root);
     }
-    fs::create_dir_all(&extract_root)
-        .map_err(|e| format!("cannot create extract dir: {e}"))?;
+    fs::create_dir_all(&extract_root).map_err(|e| format!("cannot create extract dir: {e}"))?;
 
     let extract_ps_zip = ps_quote_literal(&zip_path.to_string_lossy());
     let extract_ps_dst = ps_quote_literal(&extract_root.to_string_lossy());
@@ -705,8 +738,9 @@ fn ensure_windows_google_usb_driver_available(app: &tauri::AppHandle) -> Result<
         ));
     }
 
-    let found_inf = find_file_recursive(&extract_root, "android_winusb.inf")
-        .ok_or_else(|| "downloaded driver archive did not contain android_winusb.inf".to_string())?;
+    let found_inf = find_file_recursive(&extract_root, "android_winusb.inf").ok_or_else(|| {
+        "downloaded driver archive did not contain android_winusb.inf".to_string()
+    })?;
 
     let inf_parent = found_inf
         .parent()
@@ -722,7 +756,9 @@ fn ensure_windows_google_usb_driver_available(app: &tauri::AppHandle) -> Result<
     copy_dir_recursive(&inf_parent, &final_driver_dir)?;
 
     if !final_inf.exists() {
-        return Err("driver download/extract finished but android_winusb.inf still missing".to_string());
+        return Err(
+            "driver download/extract finished but android_winusb.inf still missing".to_string(),
+        );
     }
 
     Ok(final_inf)
@@ -779,13 +815,7 @@ fn adb_devices_raw_output(app: &tauri::AppHandle) -> Result<(String, String), St
         Command::new(&path)
             .args(["devices", "-l"])
             .output()
-            .map_err(|e| {
-                format!(
-                    "adb command failed via {}: {}",
-                    path.to_string_lossy(),
-                    e
-                )
-            })?
+            .map_err(|e| format!("adb command failed via {}: {}", path.to_string_lossy(), e))?
     } else if adb_source == "system-path: adb" {
         Command::new("adb")
             .args(["devices", "-l"])
@@ -808,8 +838,7 @@ fn adb_devices_raw_output(app: &tauri::AppHandle) -> Result<(String, String), St
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(format!(
             "adb returned non-zero status via {}: {}",
-            adb_source,
-            stderr
+            adb_source, stderr
         ));
     }
 
@@ -817,7 +846,10 @@ fn adb_devices_raw_output(app: &tauri::AppHandle) -> Result<(String, String), St
     Ok((stdout, adb_source))
 }
 
-fn discover_android_devices_internal(app: &tauri::AppHandle, allow_driver_attempt: bool) -> Result<Vec<LocalDevice>, String> {
+fn discover_android_devices_internal(
+    app: &tauri::AppHandle,
+    allow_driver_attempt: bool,
+) -> Result<Vec<LocalDevice>, String> {
     init_db(app)?;
 
     let (stdout, _) = adb_devices_raw_output(app)?;
@@ -828,7 +860,11 @@ fn discover_android_devices_internal(app: &tauri::AppHandle, allow_driver_attemp
         if first_attempt {
             let driver_msg = try_install_windows_usb_driver_best_effort(app)
                 .unwrap_or_else(|e| format!("driver auto-install skipped/failed: {}", e));
-            let _ = queue_local_event(app, "driver_install_attempt", json!({ "message": driver_msg }));
+            let _ = queue_local_event(
+                app,
+                "driver_install_attempt",
+                json!({ "message": driver_msg }),
+            );
             restart_adb_server(app);
             if let Ok((stdout2, _)) = adb_devices_raw_output(app) {
                 devices = parse_adb_devices_output(&stdout2);
@@ -840,9 +876,15 @@ fn discover_android_devices_internal(app: &tauri::AppHandle, allow_driver_attemp
     load_local_devices_internal(app)
 }
 
-fn register_node_remote_internal(app: &tauri::AppHandle, node_name: Option<String>) -> Result<bool, String> {
+fn register_node_remote_internal(
+    app: &tauri::AppHandle,
+    node_name: Option<String>,
+) -> Result<bool, String> {
     let mut cfg = load_or_create_config(app)?;
-    let endpoint = format!("{}/api/client-controller/register-node", base_url(&cfg.server_domain));
+    let endpoint = format!(
+        "{}/api/client-controller/register-node",
+        base_url(&cfg.server_domain)
+    );
     let workflow_ready = workflow_runtime_ready(app);
 
     let register_key = cfg.bootstrap_api_key.clone();
@@ -865,7 +907,7 @@ fn register_node_remote_internal(app: &tauri::AppHandle, node_name: Option<Strin
             "node_execution": true,
             "appium": false,
             "server_rebind": true,
-            "auto_update": false
+            "auto_update": true
         }
     });
 
@@ -900,7 +942,11 @@ fn register_node_remote_internal(app: &tauri::AppHandle, node_name: Option<Strin
         )
     })?;
 
-    if !body.get("success").and_then(Value::as_bool).unwrap_or(false) {
+    if !body
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Err(format!(
             "register failed: HTTP {} - {}",
             status_code.as_u16(),
@@ -941,14 +987,21 @@ fn recover_node_registration(app: &tauri::AppHandle, error: &str) -> Result<bool
     Ok(true)
 }
 
-fn heartbeat_remote_internal(app: &tauri::AppHandle, status: &str, payload: Option<Value>) -> Result<bool, String> {
+fn heartbeat_remote_internal(
+    app: &tauri::AppHandle,
+    status: &str,
+    payload: Option<Value>,
+) -> Result<bool, String> {
     let cfg = load_or_create_config(app)?;
 
     if cfg.api_key.trim().is_empty() {
         return Err("Missing api_key. Register node first.".to_string());
     }
 
-    let endpoint = format!("{}/api/client-controller/heartbeat", base_url(&cfg.server_domain));
+    let endpoint = format!(
+        "{}/api/client-controller/heartbeat",
+        base_url(&cfg.server_domain)
+    );
     let workflow_ready = workflow_runtime_ready(app);
 
     let body = json!({
@@ -967,7 +1020,8 @@ fn heartbeat_remote_internal(app: &tauri::AppHandle, status: &str, payload: Opti
             "cloakbrowser": workflow_ready,
             "workflow_tasks": workflow_ready,
             "node_execution": true,
-            "server_rebind": true
+            "server_rebind": true,
+            "auto_update": true
         }
     });
 
@@ -984,7 +1038,12 @@ fn heartbeat_remote_internal(app: &tauri::AppHandle, status: &str, payload: Opti
         .json()
         .map_err(|e| format!("heartbeat response parse failed: {e}"))?;
 
-    if !status_code.is_success() || !resp_body.get("success").and_then(Value::as_bool).unwrap_or(false) {
+    if !status_code.is_success()
+        || !resp_body
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
         return Err(format!(
             "heartbeat failed: HTTP {} - {}",
             status_code.as_u16(),
@@ -1037,7 +1096,10 @@ fn parse_adb_devices_output(raw: &str) -> Vec<LocalDevice> {
     devices
 }
 
-fn save_discovered_devices(app: &tauri::AppHandle, discovered: &[LocalDevice]) -> Result<(), String> {
+fn save_discovered_devices(
+    app: &tauri::AppHandle,
+    discovered: &[LocalDevice],
+) -> Result<(), String> {
     init_db(app)?;
     let conn = open_db(app)?;
 
@@ -1118,7 +1180,10 @@ fn sync_devices_remote_internal(app: &tauri::AppHandle) -> Result<usize, String>
     }
 
     let local_devices = load_local_devices_internal(app)?;
-    let endpoint = format!("{}/api/client-controller/sync-devices", base_url(&cfg.server_domain));
+    let endpoint = format!(
+        "{}/api/client-controller/sync-devices",
+        base_url(&cfg.server_domain)
+    );
 
     let payload = json!({
         "api_key": cfg.api_key,
@@ -1147,7 +1212,12 @@ fn sync_devices_remote_internal(app: &tauri::AppHandle) -> Result<usize, String>
         .json()
         .map_err(|e| format!("sync-devices response parse failed: {e}"))?;
 
-    if !status_code.is_success() || !body.get("success").and_then(Value::as_bool).unwrap_or(false) {
+    if !status_code.is_success()
+        || !body
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
         return Err(format!(
             "sync-devices failed: HTTP {} - {}",
             status_code.as_u16(),
@@ -1164,14 +1234,22 @@ fn sync_devices_remote_internal(app: &tauri::AppHandle) -> Result<usize, String>
 }
 
 fn bundled_workflow_node_binary(runtime_root: &Path) -> Option<PathBuf> {
-    let name = if cfg!(target_os = "windows") { "node.exe" } else { "node" };
+    let name = if cfg!(target_os = "windows") {
+        "node.exe"
+    } else {
+        "node"
+    };
     let binary = runtime_root.join("bin").join(name);
 
     binary.is_file().then_some(binary)
 }
 
 fn bundled_cloakbrowser_binary(runtime_root: &Path) -> Option<PathBuf> {
-    let name = if cfg!(target_os = "windows") { "chrome.exe" } else { "chrome" };
+    let name = if cfg!(target_os = "windows") {
+        "chrome.exe"
+    } else {
+        "chrome"
+    };
 
     find_file_recursive(&runtime_root.join(".cloakbrowser"), name)
 }
@@ -1207,7 +1285,11 @@ fn workflow_runtime_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     }
 
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("src-tauri").join("resources").join("workflow-runtime"));
+        candidates.push(
+            cwd.join("src-tauri")
+                .join("resources")
+                .join("workflow-runtime"),
+        );
         candidates.push(cwd.join("resources").join("workflow-runtime"));
         candidates.push(cwd.join("..").join("AiUserFactory"));
     }
@@ -1217,7 +1299,10 @@ fn workflow_runtime_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
 
 fn resolve_workflow_runtime(app: &tauri::AppHandle) -> Option<PathBuf> {
     workflow_runtime_candidates(app).into_iter().find(|root| {
-        root.join("node").join("workflows").join("run_step.cjs").is_file()
+        root.join("node")
+            .join("workflows")
+            .join("run_step.cjs")
+            .is_file()
             && root
                 .join("resources")
                 .join("node")
@@ -1228,7 +1313,10 @@ fn resolve_workflow_runtime(app: &tauri::AppHandle) -> Option<PathBuf> {
     })
 }
 
-fn ensure_workflow_dependencies(app: &tauri::AppHandle, runtime_root: &Path) -> Result<PathBuf, String> {
+fn ensure_workflow_dependencies(
+    app: &tauri::AppHandle,
+    runtime_root: &Path,
+) -> Result<PathBuf, String> {
     let bundled_modules = runtime_root.join("node_modules");
 
     if workflow_modules_ready(&bundled_modules) {
@@ -1249,9 +1337,7 @@ fn ensure_workflow_dependencies(app: &tauri::AppHandle, runtime_root: &Path) -> 
     let fingerprint_path = dependencies_root.join(".archive-sha256");
     let staged_fingerprint = fs::read_to_string(&fingerprint_path).unwrap_or_default();
 
-    if workflow_modules_ready(&staged_modules)
-        && staged_fingerprint.trim() == archive_fingerprint
-    {
+    if workflow_modules_ready(&staged_modules) && staged_fingerprint.trim() == archive_fingerprint {
         return Ok(staged_modules);
     }
 
@@ -1271,7 +1357,10 @@ fn ensure_workflow_dependencies(app: &tauri::AppHandle, runtime_root: &Path) -> 
         .map_err(|e| format!("extract workflow dependencies failed: {e}"))?;
 
     if !workflow_modules_ready(&staged_modules) {
-        return Err("workflow dependency archive is incomplete or missing required portable modules".to_string());
+        return Err(
+            "workflow dependency archive is incomplete or missing required portable modules"
+                .to_string(),
+        );
     }
 
     fs::write(&fingerprint_path, archive_fingerprint)
@@ -1280,7 +1369,10 @@ fn ensure_workflow_dependencies(app: &tauri::AppHandle, runtime_root: &Path) -> 
     Ok(staged_modules)
 }
 
-fn workflow_node_path(app: &tauri::AppHandle, runtime_root: &Path) -> Result<std::ffi::OsString, String> {
+fn workflow_node_path(
+    app: &tauri::AppHandle,
+    runtime_root: &Path,
+) -> Result<std::ffi::OsString, String> {
     std::env::join_paths([ensure_workflow_dependencies(app, runtime_root)?])
         .map_err(|e| format!("build portable NODE_PATH failed: {e}"))
 }
@@ -1382,7 +1474,10 @@ fn report_job_result_remote(
     error_message: Option<String>,
 ) -> Result<(), String> {
     let cfg = load_or_create_config(app)?;
-    let endpoint = format!("{}/api/client-controller/job-result", base_url(&cfg.server_domain));
+    let endpoint = format!(
+        "{}/api/client-controller/job-result",
+        base_url(&cfg.server_domain)
+    );
     let result = if result.is_object() {
         result
     } else {
@@ -1407,38 +1502,94 @@ fn report_job_result_remote(
         .map_err(|e| format!("job result response parse failed: {e}"))?;
 
     if !status_code.is_success()
-        || !response_body.get("success").and_then(Value::as_bool).unwrap_or(false)
+        || !response_body
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     {
-        return Err(format!("job result failed: HTTP {} - {}", status_code.as_u16(), response_body));
+        return Err(format!(
+            "job result failed: HTTP {} - {}",
+            status_code.as_u16(),
+            response_body
+        ));
     }
 
     Ok(())
 }
 
-fn record_local_job_execution(
+fn start_local_job_execution(app: &tauri::AppHandle, job: &RemoteJob) -> Result<i64, String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+    conn.execute(
+        "INSERT INTO job_executions_local (job_id, job_type, status, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![job.job_uuid, job.job_type, "running", json!({"startedAt": now_iso()}).to_string(), now_iso()],
+    )
+    .map_err(|e| format!("store local job execution failed: {e}"))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+fn finish_local_job_execution(
     app: &tauri::AppHandle,
-    job: &RemoteJob,
+    execution_id: i64,
     status: &str,
     details: &Value,
 ) -> Result<(), String> {
     init_db(app)?;
     let conn = open_db(app)?;
     conn.execute(
-        "INSERT INTO job_executions_local (job_id, job_type, status, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![job.job_uuid, job.job_type, status, details.to_string(), now_iso()],
+        "UPDATE job_executions_local SET status = ?1, details_json = ?2 WHERE id = ?3",
+        params![status, details.to_string(), execution_id],
     )
-    .map_err(|e| format!("store local job execution failed: {e}"))?;
+    .map_err(|e| format!("update local job execution failed: {e}"))?;
 
     Ok(())
+}
+
+fn local_processes_internal(
+    app: &tauri::AppHandle,
+    limit: i64,
+) -> Result<Vec<LocalProcess>, String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, job_id, job_type, status, COALESCE(details_json, '{}'), created_at
+             FROM job_executions_local
+             ORDER BY id DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare local process query failed: {e}"))?;
+    let rows = stmt
+        .query_map(params![limit.max(1)], |row| {
+            Ok(LocalProcess {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                job_type: row.get(2)?,
+                status: row.get(3)?,
+                details_json: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("query local processes failed: {e}"))?;
+    let mut processes = Vec::new();
+
+    for row in rows {
+        processes.push(row.map_err(|e| format!("read local process row failed: {e}"))?);
+    }
+
+    Ok(processes)
 }
 
 fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value, String> {
     let runtime_root = resolve_workflow_runtime(app)
         .ok_or_else(|| "workflow runtime not found in application resources".to_string())?;
-    let node_binary = bundled_workflow_node_binary(&runtime_root)
-        .ok_or_else(|| "bundled Node.js runtime is missing from ClientController resources".to_string())?;
-    let browser_binary = bundled_cloakbrowser_binary(&runtime_root)
-        .ok_or_else(|| "bundled CloakBrowser binary is missing from ClientController resources".to_string())?;
+    let node_binary = bundled_workflow_node_binary(&runtime_root).ok_or_else(|| {
+        "bundled Node.js runtime is missing from ClientController resources".to_string()
+    })?;
+    let browser_binary = bundled_cloakbrowser_binary(&runtime_root).ok_or_else(|| {
+        "bundled CloakBrowser binary is missing from ClientController resources".to_string()
+    })?;
     let execution_runtime_root = executable_workflow_runtime(app, &runtime_root)?;
     let mut runtime = job
         .payload
@@ -1449,7 +1600,8 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     let run_dir = ensure_runtime_dir(app)?
         .join("workflow-jobs")
         .join(&job.job_uuid);
-    fs::create_dir_all(&run_dir).map_err(|e| format!("create workflow job directory failed: {e}"))?;
+    fs::create_dir_all(&run_dir)
+        .map_err(|e| format!("create workflow job directory failed: {e}"))?;
 
     let status_path = run_dir.join("status.json");
     let result_path = run_dir.join("result.json");
@@ -1466,15 +1618,22 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     runtime_object.insert("browserProfilePath".into(), json!(browser_profile_path));
     runtime_object.insert("clientControllerJobUuid".into(), json!(job.job_uuid));
     runtime_object.insert("clientControllerDeviceUuid".into(), json!(job.device_uuid));
-    runtime_object.insert("clientControllerExecutionScope".into(), json!(job.execution_scope));
+    runtime_object.insert(
+        "clientControllerExecutionScope".into(),
+        json!(job.execution_scope),
+    );
 
     fs::write(
         &config_path,
-        serde_json::to_vec_pretty(&runtime).map_err(|e| format!("serialize workflow runtime failed: {e}"))?,
+        serde_json::to_vec_pretty(&runtime)
+            .map_err(|e| format!("serialize workflow runtime failed: {e}"))?,
     )
     .map_err(|e| format!("write workflow runtime failed: {e}"))?;
 
-    let script = execution_runtime_root.join("node").join("workflows").join("run_step.cjs");
+    let script = execution_runtime_root
+        .join("node")
+        .join("workflows")
+        .join("run_step.cjs");
     let mut command = Command::new(node_binary);
     command
         .arg(script)
@@ -1515,7 +1674,9 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
                         .and_then(Value::as_array)
                         .and_then(|tasks| {
                             tasks.iter().rev().find_map(|task| {
-                                task.get(path_key).and_then(Value::as_str).map(str::to_string)
+                                task.get(path_key)
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
                             })
                         })
                 });
@@ -1610,11 +1771,15 @@ fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Va
         "node_sync" => {
             let devices = discover_android_devices_internal(app, true)?;
             let synced = sync_devices_remote_internal(app)?;
-            heartbeat_remote_internal(app, "online", Some(json!({
-                "source": "remote-node-sync",
-                "discovered_devices": devices.len(),
-                "synced_devices": synced,
-            })))?;
+            heartbeat_remote_internal(
+                app,
+                "online",
+                Some(json!({
+                    "source": "remote-node-sync",
+                    "discovered_devices": devices.len(),
+                    "synced_devices": synced,
+                })),
+            )?;
 
             Ok(json!({
                 "ok": true,
@@ -1628,11 +1793,81 @@ fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Va
     }
 }
 
+fn execute_node_update(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value, String> {
+    let manifest_url = job
+        .payload
+        .get("manifest_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| value.starts_with("https://"))
+        .ok_or_else(|| "update manifest_url must use HTTPS".to_string())?;
+    let public_key = job
+        .payload
+        .get("updater_public_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "update public key is missing".to_string())?;
+    let target_version = job
+        .payload
+        .get("target_version")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().trim_start_matches(['v', 'V']).to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "update target_version is missing".to_string())?;
+    let endpoint = manifest_url
+        .parse()
+        .map_err(|e| format!("invalid update manifest URL: {e}"))?;
+
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|e| format!("configure update endpoint failed: {e}"))?
+        .pubkey(public_key)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("build updater failed: {e}"))?;
+    let update = tauri::async_runtime::block_on(updater.check())
+        .map_err(|e| format!("check signed update failed: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "updater manifest contains no update newer than {}",
+                env!("CARGO_PKG_VERSION")
+            )
+        })?;
+    let offered_version = update
+        .version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .to_string();
+
+    if offered_version != target_version {
+        return Err(format!(
+            "updater offered version {offered_version}, but the approved target is {target_version}"
+        ));
+    }
+
+    tauri::async_runtime::block_on(
+        update.download_and_install(|_chunk_length, _content_length| {}, || {}),
+    )
+    .map_err(|e| format!("download or installation of signed update failed: {e}"))?;
+
+    app.restart();
+}
+
 fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
+    let execution_id = start_local_job_execution(&app, &job).ok();
     let cfg = match load_or_create_config(&app) {
         Ok(cfg) => cfg,
         Err(error) => {
-            let _ = record_local_job_execution(&app, &job, "failed", &json!({ "error": error }));
+            if let Some(execution_id) = execution_id {
+                let _ = finish_local_job_execution(
+                    &app,
+                    execution_id,
+                    "failed",
+                    &json!({ "error": error }),
+                );
+            }
             return;
         }
     };
@@ -1643,27 +1878,39 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
         "node_diagnostics" | "node_outbox_list" | "node_outbox_clear" | "node_discover_devices" | "node_sync" => {
             execute_node_control_job(&app, &job.job_type)
         }
+        "node_update" => execute_node_update(&app, &job),
         other => Err(format!("unsupported ClientController job type: {other}")),
     });
 
     match execution {
         Ok(result) => {
-            let _ = record_local_job_execution(&app, &job, "success", &result);
-            if let Err(error) = report_job_result_remote(&app, &job.job_uuid, "success", result, None) {
-                let _ = queue_local_event(&app, "job_result_failed", json!({ "job_uuid": job.job_uuid, "error": error }));
+            if let Some(execution_id) = execution_id {
+                let _ = finish_local_job_execution(&app, execution_id, "success", &result);
+            }
+            if let Err(error) =
+                report_job_result_remote(&app, &job.job_uuid, "success", result, None)
+            {
+                let _ = queue_local_event(
+                    &app,
+                    "job_result_failed",
+                    json!({ "job_uuid": job.job_uuid, "error": error }),
+                );
             }
         }
         Err(error) => {
-            let details = json!({ "ok": false, "status": "failed", "statusMessage": error.clone() });
-            let _ = record_local_job_execution(&app, &job, "failed", &details);
-            if let Err(report_error) = report_job_result_remote(
-                &app,
-                &job.job_uuid,
-                "failed",
-                details,
-                Some(error),
-            ) {
-                let _ = queue_local_event(&app, "job_result_failed", json!({ "job_uuid": job.job_uuid, "error": report_error }));
+            let details =
+                json!({ "ok": false, "status": "failed", "statusMessage": error.clone() });
+            if let Some(execution_id) = execution_id {
+                let _ = finish_local_job_execution(&app, execution_id, "failed", &details);
+            }
+            if let Err(report_error) =
+                report_job_result_remote(&app, &job.job_uuid, "failed", details, Some(error))
+            {
+                let _ = queue_local_event(
+                    &app,
+                    "job_result_failed",
+                    json!({ "job_uuid": job.job_uuid, "error": report_error }),
+                );
             }
         }
     }
@@ -1671,7 +1918,10 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
 
 fn pull_and_start_jobs_remote_internal(app: &tauri::AppHandle) -> Result<usize, String> {
     let cfg = load_or_create_config(app)?;
-    let endpoint = format!("{}/api/client-controller/pull-jobs", base_url(&cfg.server_domain));
+    let endpoint = format!(
+        "{}/api/client-controller/pull-jobs",
+        base_url(&cfg.server_domain)
+    );
     let response = http_client()?
         .post(endpoint)
         .header("X-NODE-API-KEY", cfg.api_key.clone())
@@ -1683,12 +1933,22 @@ fn pull_and_start_jobs_remote_internal(app: &tauri::AppHandle) -> Result<usize, 
         .json()
         .map_err(|e| format!("pull jobs response parse failed: {e}"))?;
 
-    if !status_code.is_success() || !body.get("success").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(format!("pull jobs failed: HTTP {} - {}", status_code.as_u16(), body));
+    if !status_code.is_success()
+        || !body
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "pull jobs failed: HTTP {} - {}",
+            status_code.as_u16(),
+            body
+        ));
     }
 
-    let jobs: Vec<RemoteJob> = serde_json::from_value(body.get("jobs").cloned().unwrap_or_else(|| json!([])))
-        .map_err(|e| format!("parse pulled jobs failed: {e}"))?;
+    let jobs: Vec<RemoteJob> =
+        serde_json::from_value(body.get("jobs").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| format!("parse pulled jobs failed: {e}"))?;
     let count = jobs.len();
 
     for job in jobs {
@@ -1718,7 +1978,11 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
                         notes.push("register:ok".to_string());
                     }
                     Err(err) => {
-                        let _ = queue_local_event(app, "register_node_failed", json!({ "error": err.clone() }));
+                        let _ = queue_local_event(
+                            app,
+                            "register_node_failed",
+                            json!({ "error": err.clone() }),
+                        );
                         notes.push(format!("register:fail({})", preview_body(&err, 120)));
                     }
                 }
@@ -1737,7 +2001,11 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
             notes.push(format!("discover:ok({})", discovered_devices));
         }
         Err(err) => {
-            let _ = queue_local_event(app, "discover_devices_failed", json!({ "error": err.clone() }));
+            let _ = queue_local_event(
+                app,
+                "discover_devices_failed",
+                json!({ "error": err.clone() }),
+            );
             notes.push(format!("discover:fail({})", preview_body(&err, 120)));
         }
     }
@@ -1747,33 +2015,46 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
             synced_devices = count;
             notes.push(format!("sync:ok({})", count));
         }
-        Err(err) => {
-            match recover_node_registration(app, &err) {
-                Ok(true) => {
-                    registered = true;
-                    notes.push("register:recovered(unauthorized)".to_string());
+        Err(err) => match recover_node_registration(app, &err) {
+            Ok(true) => {
+                registered = true;
+                notes.push("register:recovered(unauthorized)".to_string());
 
-                    match sync_devices_remote_internal(app) {
-                        Ok(count) => {
-                            synced_devices = count;
-                            notes.push(format!("sync:retry-ok({})", count));
-                        }
-                        Err(retry_err) => {
-                            let _ = queue_local_event(app, "sync_devices_failed", json!({ "error": retry_err.clone(), "after_reregister": true }));
-                            notes.push(format!("sync:retry-fail({})", preview_body(&retry_err, 120)));
-                        }
+                match sync_devices_remote_internal(app) {
+                    Ok(count) => {
+                        synced_devices = count;
+                        notes.push(format!("sync:retry-ok({})", count));
+                    }
+                    Err(retry_err) => {
+                        let _ = queue_local_event(
+                            app,
+                            "sync_devices_failed",
+                            json!({ "error": retry_err.clone(), "after_reregister": true }),
+                        );
+                        notes.push(format!(
+                            "sync:retry-fail({})",
+                            preview_body(&retry_err, 120)
+                        ));
                     }
                 }
-                Ok(false) => {
-                    let _ = queue_local_event(app, "sync_devices_failed", json!({ "error": err.clone() }));
-                    notes.push(format!("sync:fail({})", preview_body(&err, 120)));
-                }
-                Err(register_err) => {
-                    let _ = queue_local_event(app, "register_node_failed", json!({ "error": register_err.clone(), "trigger": err }));
-                    notes.push(format!("register:recovery-fail({})", preview_body(&register_err, 120)));
-                }
             }
-        }
+            Ok(false) => {
+                let _ =
+                    queue_local_event(app, "sync_devices_failed", json!({ "error": err.clone() }));
+                notes.push(format!("sync:fail({})", preview_body(&err, 120)));
+            }
+            Err(register_err) => {
+                let _ = queue_local_event(
+                    app,
+                    "register_node_failed",
+                    json!({ "error": register_err.clone(), "trigger": err }),
+                );
+                notes.push(format!(
+                    "register:recovery-fail({})",
+                    preview_body(&register_err, 120)
+                ));
+            }
+        },
     }
 
     match heartbeat_remote_internal(
@@ -1789,33 +2070,49 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
             heartbeat_sent = true;
             notes.push("heartbeat:ok".to_string());
         }
-        Err(err) => {
-            match recover_node_registration(app, &err) {
-                Ok(true) => {
-                    registered = true;
-                    notes.push("register:recovered-before-heartbeat".to_string());
+        Err(err) => match recover_node_registration(app, &err) {
+            Ok(true) => {
+                registered = true;
+                notes.push("register:recovered-before-heartbeat".to_string());
 
-                    match heartbeat_remote_internal(app, "online", Some(json!({ "source": "autopilot-retry" }))) {
-                        Ok(_) => {
-                            heartbeat_sent = true;
-                            notes.push("heartbeat:retry-ok".to_string());
-                        }
-                        Err(retry_err) => {
-                            let _ = queue_local_event(app, "heartbeat_failed", json!({ "error": retry_err.clone(), "after_reregister": true }));
-                            notes.push(format!("heartbeat:retry-fail({})", preview_body(&retry_err, 120)));
-                        }
+                match heartbeat_remote_internal(
+                    app,
+                    "online",
+                    Some(json!({ "source": "autopilot-retry" })),
+                ) {
+                    Ok(_) => {
+                        heartbeat_sent = true;
+                        notes.push("heartbeat:retry-ok".to_string());
+                    }
+                    Err(retry_err) => {
+                        let _ = queue_local_event(
+                            app,
+                            "heartbeat_failed",
+                            json!({ "error": retry_err.clone(), "after_reregister": true }),
+                        );
+                        notes.push(format!(
+                            "heartbeat:retry-fail({})",
+                            preview_body(&retry_err, 120)
+                        ));
                     }
                 }
-                Ok(false) => {
-                    let _ = queue_local_event(app, "heartbeat_failed", json!({ "error": err.clone() }));
-                    notes.push(format!("heartbeat:fail({})", preview_body(&err, 120)));
-                }
-                Err(register_err) => {
-                    let _ = queue_local_event(app, "register_node_failed", json!({ "error": register_err.clone(), "trigger": err }));
-                    notes.push(format!("register:heartbeat-recovery-fail({})", preview_body(&register_err, 120)));
-                }
             }
-        }
+            Ok(false) => {
+                let _ = queue_local_event(app, "heartbeat_failed", json!({ "error": err.clone() }));
+                notes.push(format!("heartbeat:fail({})", preview_body(&err, 120)));
+            }
+            Err(register_err) => {
+                let _ = queue_local_event(
+                    app,
+                    "register_node_failed",
+                    json!({ "error": register_err.clone(), "trigger": err }),
+                );
+                notes.push(format!(
+                    "register:heartbeat-recovery-fail({})",
+                    preview_body(&register_err, 120)
+                ));
+            }
+        },
     }
 
     match pull_and_start_jobs_remote_internal(app) {
@@ -1823,33 +2120,45 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
             jobs_started = count;
             notes.push(format!("jobs:ok({})", count));
         }
-        Err(err) => {
-            match recover_node_registration(app, &err) {
-                Ok(true) => {
-                    registered = true;
-                    notes.push("register:recovered-before-jobs".to_string());
+        Err(err) => match recover_node_registration(app, &err) {
+            Ok(true) => {
+                registered = true;
+                notes.push("register:recovered-before-jobs".to_string());
 
-                    match pull_and_start_jobs_remote_internal(app) {
-                        Ok(count) => {
-                            jobs_started = count;
-                            notes.push(format!("jobs:retry-ok({})", count));
-                        }
-                        Err(retry_err) => {
-                            let _ = queue_local_event(app, "pull_jobs_failed", json!({ "error": retry_err.clone(), "after_reregister": true }));
-                            notes.push(format!("jobs:retry-fail({})", preview_body(&retry_err, 120)));
-                        }
+                match pull_and_start_jobs_remote_internal(app) {
+                    Ok(count) => {
+                        jobs_started = count;
+                        notes.push(format!("jobs:retry-ok({})", count));
+                    }
+                    Err(retry_err) => {
+                        let _ = queue_local_event(
+                            app,
+                            "pull_jobs_failed",
+                            json!({ "error": retry_err.clone(), "after_reregister": true }),
+                        );
+                        notes.push(format!(
+                            "jobs:retry-fail({})",
+                            preview_body(&retry_err, 120)
+                        ));
                     }
                 }
-                Ok(false) => {
-                    let _ = queue_local_event(app, "pull_jobs_failed", json!({ "error": err.clone() }));
-                    notes.push(format!("jobs:fail({})", preview_body(&err, 120)));
-                }
-                Err(register_err) => {
-                    let _ = queue_local_event(app, "register_node_failed", json!({ "error": register_err.clone(), "trigger": err }));
-                    notes.push(format!("register:jobs-recovery-fail({})", preview_body(&register_err, 120)));
-                }
             }
-        }
+            Ok(false) => {
+                let _ = queue_local_event(app, "pull_jobs_failed", json!({ "error": err.clone() }));
+                notes.push(format!("jobs:fail({})", preview_body(&err, 120)));
+            }
+            Err(register_err) => {
+                let _ = queue_local_event(
+                    app,
+                    "register_node_failed",
+                    json!({ "error": register_err.clone(), "trigger": err }),
+                );
+                notes.push(format!(
+                    "register:jobs-recovery-fail({})",
+                    preview_body(&register_err, 120)
+                ));
+            }
+        },
     }
 
     Ok(SyncSummary {
@@ -1893,6 +2202,14 @@ fn get_client_status(app: tauri::AppHandle) -> Result<ClientStatus, String> {
         .query_row("SELECT COUNT(*) FROM local_devices", [], |row| row.get(0))
         .map_err(|e| format!("count local devices failed: {e}"))?;
 
+    let running_processes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM job_executions_local WHERE status = 'running'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("count running processes failed: {e}"))?;
+
     let (adb_source, adb_available) = detect_adb_source(&app);
     let workflow_runtime = resolve_workflow_runtime(&app);
     let node_available = workflow_runtime
@@ -1913,11 +2230,25 @@ fn get_client_status(app: tauri::AppHandle) -> Result<ClientStatus, String> {
         workflow_runtime_path: workflow_runtime
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        running_processes,
+        updater_available: true,
     })
 }
 
 #[tauri::command]
-fn update_server_domain(app: tauri::AppHandle, server_domain: String) -> Result<GenericResult, String> {
+fn get_local_processes(
+    app: tauri::AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<LocalProcess>, String> {
+    local_processes_internal(&app, limit.unwrap_or(100))
+}
+
+#[tauri::command]
+fn update_server_domain(
+    app: tauri::AppHandle,
+    server_domain: String,
+) -> Result<GenericResult, String> {
     let mut cfg = load_or_create_config(&app)?;
     let normalized = canonical_server_domain(&server_domain);
     cfg.server_domain = normalized.clone();
@@ -1935,7 +2266,11 @@ fn update_server_domain(app: tauri::AppHandle, server_domain: String) -> Result<
 }
 
 #[tauri::command]
-fn queue_event_local(app: tauri::AppHandle, event_type: String, payload: Value) -> Result<GenericResult, String> {
+fn queue_event_local(
+    app: tauri::AppHandle,
+    event_type: String,
+    payload: Value,
+) -> Result<GenericResult, String> {
     queue_local_event(&app, &event_type, payload)?;
 
     Ok(GenericResult {
@@ -1945,7 +2280,10 @@ fn queue_event_local(app: tauri::AppHandle, event_type: String, payload: Value) 
 }
 
 #[tauri::command]
-fn get_pending_events(app: tauri::AppHandle, limit: Option<i64>) -> Result<Vec<OutboxEvent>, String> {
+fn get_pending_events(
+    app: tauri::AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<OutboxEvent>, String> {
     init_db(&app)?;
     let conn = open_db(&app)?;
     let lim = limit.unwrap_or(50).max(1);
@@ -2030,7 +2368,10 @@ fn log_heartbeat_local(
 }
 
 #[tauri::command]
-fn apply_rebind_request(app: tauri::AppHandle, request: RebindRequest) -> Result<GenericResult, String> {
+fn apply_rebind_request(
+    app: tauri::AppHandle,
+    request: RebindRequest,
+) -> Result<GenericResult, String> {
     let mut cfg = load_or_create_config(&app)?;
     init_db(&app)?;
     let conn = open_db(&app)?;
@@ -2102,14 +2443,21 @@ fn apply_rebind_request(app: tauri::AppHandle, request: RebindRequest) -> Result
 }
 
 #[tauri::command]
-fn register_node_remote(app: tauri::AppHandle, node_name: Option<String>) -> Result<GenericResult, String> {
+fn register_node_remote(
+    app: tauri::AppHandle,
+    node_name: Option<String>,
+) -> Result<GenericResult, String> {
     match register_node_remote_internal(&app, node_name) {
         Ok(_) => Ok(GenericResult {
             success: true,
             message: "Node successfully registered on server".to_string(),
         }),
         Err(err) => {
-            let _ = queue_local_event(&app, "register_node_failed", json!({ "error": err.clone() }));
+            let _ = queue_local_event(
+                &app,
+                "register_node_failed",
+                json!({ "error": err.clone() }),
+            );
             Err(err)
         }
     }
@@ -2190,6 +2538,8 @@ fn run_full_sync(app: tauri::AppHandle) -> Result<SyncSummary, String> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let _ = bootstrap_local_runtime(handle.clone());
@@ -2205,6 +2555,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bootstrap_local_runtime,
             get_client_status,
+            get_local_processes,
             update_server_domain,
             queue_event_local,
             get_pending_events,
@@ -2233,7 +2584,9 @@ mod tests {
         assert!(authentication_failed(
             "sync-devices failed: HTTP 401 - {\"message\":\"Unauthorized node.\"}"
         ));
-        assert!(authentication_failed("register failed: HTTP 403 - forbidden"));
+        assert!(authentication_failed(
+            "register failed: HTTP 403 - forbidden"
+        ));
         assert!(!authentication_failed("request failed: connection refused"));
     }
 }

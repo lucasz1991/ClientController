@@ -2,12 +2,13 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
+type PageKey = "overview" | "devices" | "processes" | "outbox" | "settings";
+type FeedbackType = "info" | "success" | "error";
+
 type ClientConfig = {
   server_domain: string;
   node_uuid: string;
-  node_key: string;
   api_key: string;
-  bootstrap_api_key: string;
   environment: string;
   allow_server_rebind: boolean;
   last_successful_server: string;
@@ -24,13 +25,9 @@ type ClientStatus = {
   node_available: boolean;
   workflow_runtime_available: boolean;
   workflow_runtime_path: string;
-};
-
-type OutboxEvent = {
-  id: number;
-  event_type: string;
-  payload_json: string;
-  created_at: string;
+  app_version: string;
+  running_processes: number;
+  updater_available: boolean;
 };
 
 type LocalDevice = {
@@ -41,7 +38,22 @@ type LocalDevice = {
   adb_serial?: string | null;
   status: string;
   last_seen_at: string;
-  raw_json: string;
+};
+
+type OutboxEvent = {
+  id: number;
+  event_type: string;
+  payload_json: string;
+  created_at: string;
+};
+
+type LocalProcess = {
+  id: number;
+  job_id?: string | null;
+  job_type: string;
+  status: string;
+  details_json: string;
+  created_at: string;
 };
 
 type SyncSummary = {
@@ -53,872 +65,232 @@ type SyncSummary = {
   message: string;
 };
 
-type FeedbackType = "info" | "success" | "error";
-type TabKey = "overview" | "sync" | "outbox" | "settings";
+const pages: Array<{ key: PageKey; label: string; icon: string }> = [
+  { key: "overview", label: "Übersicht", icon: "⌂" },
+  { key: "devices", label: "Geräte", icon: "▣" },
+  { key: "processes", label: "Prozesse", icon: "◫" },
+  { key: "outbox", label: "Outbox", icon: "⇄" },
+  { key: "settings", label: "Einstellungen", icon: "⚙" },
+];
 
-const CORRECT_SERVER_URL = "https://factory.follow-flow.de";
-const AUTOPILOT_INTERVAL_MS = 30_000;
-
+const activePage = ref<PageKey>("overview");
 const status = ref<ClientStatus | null>(null);
-const pendingEvents = ref<OutboxEvent[]>([]);
-const localDevices = ref<LocalDevice[]>([]);
-
-const feedback = ref("Bereit.");
+const devices = ref<LocalDevice[]>([]);
+const processes = ref<LocalProcess[]>([]);
+const events = ref<OutboxEvent[]>([]);
+const serverDomain = ref("https://factory.follow-flow.de");
+const eventType = ref("network_test");
+const eventPayload = ref('{"source":"client-ui"}');
+const busy = ref<string | null>(null);
+const feedback = ref("Node-Dienst wird initialisiert …");
 const feedbackType = ref<FeedbackType>("info");
+const lastCycleAt = ref("–");
+const lastCycleSummary = ref("Noch kein manueller Lauf");
+let refreshTimer: number | null = null;
 
-const busy = ref<Record<string, boolean>>({});
-const isBusy = computed(() => Object.values(busy.value).some(Boolean));
-const scansActive = computed(() => Boolean(autopilotActive.value || busy.value.discover || busy.value.autopilot));
-
-const activeTab = ref<TabKey>("overview");
-
-const newServerDomain = ref(CORRECT_SERVER_URL);
-const testEventType = ref("network_test");
-const testPayload = ref('{"target":"https://example.com","result":"ok"}');
-const rebindNewDomain = ref("https://factory.follow-flow.de");
-const rebindExpiresAt = ref("2026-06-10T18:00:00Z");
-const rebindSignature = ref("followflow-default-node-key-change-me");
-
-const autopilotActive = ref(false);
-const autopilotLastRunAt = ref<string>("-");
-const autopilotLastMessage = ref<string>("Noch kein Lauf");
-const nextScanInSeconds = ref<number | null>(null);
-
-let autopilotTimer: number | null = null;
-let countdownTimer: number | null = null;
-let nextAutopilotRunAtMs: number | null = null;
-
-const hasLegacyServerUrl = computed(() => {
-  const current = (status.value?.config.server_domain || "").toLowerCase();
-  return current.includes("https://factory.followflow.de");
-});
+const isBusy = computed(() => busy.value !== null);
+const online = computed(() => Boolean(status.value?.config.api_key));
+const runtimeReady = computed(() => Boolean(status.value?.node_available && status.value?.workflow_runtime_available));
 
 function setFeedback(message: string, type: FeedbackType = "info") {
   feedback.value = message;
   feedbackType.value = type;
 }
 
-async function runAction(key: string, action: () => Promise<void>) {
-  busy.value[key] = true;
+async function runAction(key: string, callback: () => Promise<void>) {
+  if (isBusy.value) return;
+  busy.value = key;
   try {
-    await action();
+    await callback();
+  } catch (error) {
+    setFeedback(String(error), "error");
   } finally {
-    busy.value[key] = false;
+    busy.value = null;
   }
 }
 
-function syncCountdownValue() {
-  if (!autopilotActive.value || nextAutopilotRunAtMs === null) {
-    nextScanInSeconds.value = null;
-    return;
+async function refresh(silent = false) {
+  try {
+    await invoke("bootstrap_local_runtime");
+    const [clientStatus, localDevices, localProcesses, pendingEvents] = await Promise.all([
+      invoke<ClientStatus>("get_client_status"),
+      invoke<LocalDevice[]>("get_local_devices"),
+      invoke<LocalProcess[]>("get_local_processes", { limit: 100 }),
+      invoke<OutboxEvent[]>("get_pending_events", { limit: 100 }),
+    ]);
+    status.value = clientStatus;
+    devices.value = localDevices;
+    processes.value = localProcesses;
+    events.value = pendingEvents;
+    serverDomain.value = clientStatus.config.server_domain;
+    if (!silent) setFeedback("Lokaler Status wurde aktualisiert.", "success");
+  } catch (error) {
+    if (!silent) setFeedback(`Status konnte nicht geladen werden: ${String(error)}`, "error");
   }
-
-  const diffMs = nextAutopilotRunAtMs - Date.now();
-  nextScanInSeconds.value = Math.max(0, Math.ceil(diffMs / 1000));
 }
 
-function startCountdownTicker() {
-  if (countdownTimer !== null) return;
-  countdownTimer = window.setInterval(syncCountdownValue, 1_000);
-  syncCountdownValue();
-}
-
-function stopCountdownTicker() {
-  if (countdownTimer !== null) {
-    window.clearInterval(countdownTimer);
-    countdownTimer = null;
-  }
-  nextAutopilotRunAtMs = null;
-  nextScanInSeconds.value = null;
-}
-
-async function refreshStatus() {
-  await runAction("refresh", async () => {
-    try {
-      await invoke("bootstrap_local_runtime");
-      status.value = await invoke<ClientStatus>("get_client_status");
-      newServerDomain.value = CORRECT_SERVER_URL;
-      pendingEvents.value = await invoke<OutboxEvent[]>("get_pending_events", { limit: 20 });
-      localDevices.value = await invoke<LocalDevice[]>("get_local_devices");
-    } catch (err) {
-      setFeedback(`Fehler beim Laden: ${String(err)}`, "error");
-    }
-  });
-}
-
-async function runAutopilotCycle(showFeedback = false) {
-  if (busy.value.autopilot) return;
-
-  await runAction("autopilot", async () => {
-    try {
-      const result = await invoke<SyncSummary>("run_autopilot_cycle");
-      autopilotLastRunAt.value = new Date().toLocaleTimeString();
-      autopilotLastMessage.value = result.message;
-      await refreshStatus();
-
-      if (showFeedback) {
-        setFeedback(
-          `Autopilot-Lauf: discovered=${result.discovered_devices}, synced=${result.synced_devices}, heartbeat=${result.heartbeat_sent}`,
-          "success"
-        );
-      }
-    } catch (err) {
-      autopilotLastRunAt.value = new Date().toLocaleTimeString();
-      autopilotLastMessage.value = `Fehler: ${String(err)}`;
-      if (showFeedback) setFeedback(`Autopilot-Fehler: ${String(err)}`, "error");
-    }
-  });
-}
-
-function startAutopilot() {
-  if (autopilotActive.value) return;
-  autopilotActive.value = true;
-
-  nextAutopilotRunAtMs = Date.now() + AUTOPILOT_INTERVAL_MS;
-  startCountdownTicker();
-  runAutopilotCycle(true);
-
-  autopilotTimer = window.setInterval(() => {
-    nextAutopilotRunAtMs = Date.now() + AUTOPILOT_INTERVAL_MS;
-    syncCountdownValue();
-    runAutopilotCycle(false);
-  }, AUTOPILOT_INTERVAL_MS);
-}
-
-function stopAutopilot() {
-  autopilotActive.value = false;
-  if (autopilotTimer !== null) {
-    window.clearInterval(autopilotTimer);
-    autopilotTimer = null;
-  }
-  stopCountdownTicker();
-}
-
-async function saveServerDomain() {
-  await runAction("saveDomain", async () => {
-    try {
-      await invoke("update_server_domain", { server_domain: newServerDomain.value.trim() });
-      await refreshStatus();
-      setFeedback("Server-Domain gespeichert.", "success");
-    } catch (err) {
-      setFeedback(`Fehler beim Speichern: ${String(err)}`, "error");
-    }
-  });
-}
-
-async function applyCorrectServerUrl() {
-  newServerDomain.value = CORRECT_SERVER_URL;
-  await saveServerDomain();
-}
-
-async function registerNodeRemote() {
-  await runAction("register", async () => {
-    try {
-      await invoke("register_node_remote", { node_name: null });
-      await refreshStatus();
-      setFeedback("Node am Server registriert.", "success");
-    } catch (err) {
-      setFeedback(`Register-Fehler: ${String(err)}`, "error");
-    }
-  });
-}
-
-async function sendHeartbeatRemote() {
-  await runAction("heartbeat", async () => {
-    try {
-      await invoke("send_heartbeat_remote", {
-        status: "online",
-        payload: { source: "ui", note: "manual heartbeat" },
-      });
-      setFeedback("Heartbeat an Server gesendet.", "success");
-    } catch (err) {
-      setFeedback(`Heartbeat-Fehler: ${String(err)}`, "error");
-    }
+async function runAutopilot() {
+  await runAction("cycle", async () => {
+    const summary = await invoke<SyncSummary>("run_autopilot_cycle");
+    lastCycleAt.value = new Date().toLocaleTimeString("de-DE");
+    lastCycleSummary.value = summary.message;
+    await refresh(true);
+    setFeedback(`Synchronisierung abgeschlossen, ${summary.jobs_started} Job(s) übernommen.`, "success");
   });
 }
 
 async function discoverDevices() {
   await runAction("discover", async () => {
-    try {
-      localDevices.value = await invoke<LocalDevice[]>("discover_android_devices");
-      await refreshStatus();
-      setFeedback(`${localDevices.value.length} Geräte lokal erkannt.`, "success");
-    } catch (err) {
-      setFeedback(`ADB-Erkennung fehlgeschlagen: ${String(err)}`, "error");
-    }
+    devices.value = await invoke<LocalDevice[]>("discover_android_devices");
+    await refresh(true);
+    setFeedback(`${devices.value.length} Gerät(e) erkannt.`, "success");
   });
 }
 
-async function installWindowsDriver() {
-  await runAction("installDriver", async () => {
-    try {
-      const result = await invoke<{ success: boolean; message: string }>("install_windows_usb_driver");
-      setFeedback(`Treiber-Installationsversuch: ${result.message}`, "success");
-      await discoverDevices();
-    } catch (err) {
-      setFeedback(`Treiber-Installation fehlgeschlagen: ${String(err)}`, "error");
-    }
+async function syncDevices() {
+  await runAction("sync", async () => {
+    await invoke("sync_devices_remote");
+    await refresh(true);
+    setFeedback("Geräte wurden mit AiUserFactory synchronisiert.", "success");
   });
 }
 
-async function syncDevicesRemote() {
-  await runAction("syncDevices", async () => {
-    try {
-      await invoke("sync_devices_remote");
-      setFeedback("Geräte an Laravel synchronisiert.", "success");
-    } catch (err) {
-      setFeedback(`Device-Sync-Fehler: ${String(err)}`, "error");
-    }
+async function registerNode() {
+  await runAction("register", async () => {
+    await invoke("register_node_remote", { node_name: null });
+    await refresh(true);
+    setFeedback("Node wurde registriert.", "success");
   });
 }
 
-async function queueTestEvent() {
-  await runAction("queueEvent", async () => {
-    try {
-      const payloadObj = JSON.parse(testPayload.value);
-      await invoke("queue_event_local", {
-        event_type: testEventType.value,
-        payload: payloadObj,
-      });
-      await refreshStatus();
-      setFeedback("Event lokal gespeichert (Outbox).", "success");
-    } catch (err) {
-      setFeedback(`Fehler beim Event-Queueing: ${String(err)}`, "error");
-    }
+async function sendHeartbeat() {
+  await runAction("heartbeat", async () => {
+    await invoke("send_heartbeat_remote", { status: "online", payload: { source: "client-ui" } });
+    setFeedback("Heartbeat wurde gesendet.", "success");
   });
 }
 
-async function markAsSent(eventId: number) {
-  await runAction(`mark-${eventId}`, async () => {
-    try {
-      await invoke("mark_event_sent", { event_id: eventId });
-      await refreshStatus();
-      setFeedback(`Event ${eventId} als gesendet markiert.`, "success");
-    } catch (err) {
-      setFeedback(`Fehler beim Markieren: ${String(err)}`, "error");
-    }
+async function saveServerDomain() {
+  await runAction("domain", async () => {
+    await invoke("update_server_domain", { server_domain: serverDomain.value.trim() });
+    await refresh(true);
+    setFeedback("Server-Domain wurde gespeichert.", "success");
   });
 }
 
-async function logHeartbeatLocal() {
-  await runAction("heartbeatLocal", async () => {
-    try {
-      await invoke("log_heartbeat_local", {
-        status: "ok",
-        details: { source: "ui", note: "manual local heartbeat" },
-      });
-      setFeedback("Heartbeat lokal protokolliert.", "success");
-    } catch (err) {
-      setFeedback(`Heartbeat-Fehler: ${String(err)}`, "error");
-    }
+async function queueEvent() {
+  await runAction("event", async () => {
+    await invoke("queue_event_local", { event_type: eventType.value.trim(), payload: JSON.parse(eventPayload.value) });
+    await refresh(true);
+    setFeedback("Event wurde in der lokalen Outbox gespeichert.", "success");
   });
 }
 
-async function applyRebind() {
-  await runAction("rebind", async () => {
-    try {
-      await invoke("apply_rebind_request", {
-        request: {
-          new_server_domain: rebindNewDomain.value,
-          expires_at: rebindExpiresAt.value,
-          signature: rebindSignature.value,
-        },
-      });
-      await refreshStatus();
-      setFeedback("Rebind-Request verarbeitet.", "success");
-    } catch (err) {
-      setFeedback(`Rebind-Fehler: ${String(err)}`, "error");
-    }
+async function markEventSent(id: number) {
+  await runAction(`event-${id}`, async () => {
+    await invoke("mark_event_sent", { event_id: id });
+    await refresh(true);
   });
+}
+
+function readableDetails(raw: string) {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
 }
 
 onMounted(async () => {
-  await refreshStatus();
-  startAutopilot();
+  await refresh(true);
+  setFeedback("Hintergrunddienst aktiv. Updateaufträge werden beim nächsten Serverkontakt geprüft.");
+  refreshTimer = window.setInterval(() => refresh(true), 5_000);
 });
 
 onUnmounted(() => {
-  stopAutopilot();
+  if (refreshTimer !== null) window.clearInterval(refreshTimer);
 });
 </script>
 
 <template>
-  <main class="container">
-    <header class="header">
-      <div>
-        <h1>FollowFlow ClientController</h1>
-        <p class="subtitle">Klarere Oberfläche mit Autopilot für Registrierung, Scan, Sync und Heartbeat</p>
-      </div>
-      <div class="row">
-        <button class="btn secondary" @click="refreshStatus" :disabled="isBusy">
-          <span v-if="busy.refresh" class="spinner tiny"></span>
-          Neu laden
-        </button>
-        <button v-if="!autopilotActive" class="btn" @click="startAutopilot">Autopilot starten</button>
-        <button v-else class="btn danger" @click="stopAutopilot">Autopilot stoppen</button>
-      </div>
-    </header>
-
-    <section class="autopilot-strip">
-      <span><strong>Status:</strong> {{ autopilotActive ? "Aktiv" : "Inaktiv" }}</span>
-      <span><strong>Letzter Lauf:</strong> {{ autopilotLastRunAt }}</span>
-      <span><strong>Ergebnis:</strong> {{ autopilotLastMessage }}</span>
-    </section>
-
-    <section v-if="status" class="stats-grid">
-      <article class="stat-card">
-        <span>Server</span>
-        <strong>{{ status.config.server_domain }}</strong>
-      </article>
-      <article class="stat-card">
-        <span>Node UUID</span>
-        <strong class="mono">{{ status.config.node_uuid }}</strong>
-      </article>
-      <article class="stat-card">
-        <span>Pending Outbox</span>
-        <strong>{{ status.pending_events }}</strong>
-      </article>
-      <article class="stat-card">
-        <span>Lokale Geräte</span>
-        <strong>{{ status.local_devices }}</strong>
-      </article>
-      <article class="stat-card">
-        <span>ADB</span>
-        <strong :class="status.adb_available ? 'ok' : 'bad'">
-          {{ status.adb_available ? "Verfügbar" : "Nicht gefunden" }}
-        </strong>
-      </article>
-      <article class="stat-card">
-        <span>Node.js / Workflow-Runtime</span>
-        <strong :class="status.node_available && status.workflow_runtime_available ? 'ok' : 'bad'">
-          {{ status.node_available && status.workflow_runtime_available ? "Bereit" : "Nicht bereit" }}
-        </strong>
-      </article>
-    </section>
-
-    <section v-if="hasLegacyServerUrl" class="legacy-warning">
-      <p>
-        ⚠️ In der Konfiguration steht noch eine alte URL (<code>{{ status?.config.server_domain }}</code>).
-      </p>
-      <button class="btn danger" @click="applyCorrectServerUrl" :disabled="isBusy">
-        Auf {{ CORRECT_SERVER_URL }} korrigieren
-      </button>
-    </section>
-
-    <nav class="tabs">
-      <button :class="['tab', { active: activeTab === 'overview' }]" @click="activeTab = 'overview'">Übersicht</button>
-      <button :class="['tab', { active: activeTab === 'sync' }]" @click="activeTab = 'sync'">Sync & Geräte</button>
-      <button :class="['tab', { active: activeTab === 'outbox' }]" @click="activeTab = 'outbox'">Outbox</button>
-      <button :class="['tab', { active: activeTab === 'settings' }]" @click="activeTab = 'settings'">Einstellungen</button>
-    </nav>
-
-    <section v-if="activeTab === 'overview'" class="card">
-      <h2>Schnellaktionen (optional)</h2>
-      <div class="actions-grid">
-        <button class="btn" @click="runAutopilotCycle(true)" :disabled="isBusy">
-          <span v-if="busy.autopilot" class="spinner"></span>
-          Autopilot-Lauf jetzt
-        </button>
-        <button class="btn" @click="registerNodeRemote" :disabled="isBusy">
-          <span v-if="busy.register" class="spinner"></span>
-          Node registrieren
-        </button>
-        <button class="btn" @click="sendHeartbeatRemote" :disabled="isBusy">
-          <span v-if="busy.heartbeat" class="spinner"></span>
-          Heartbeat senden
-        </button>
-        <button class="btn secondary" @click="logHeartbeatLocal" :disabled="isBusy">
-          <span v-if="busy.heartbeatLocal" class="spinner"></span>
-          Heartbeat lokal loggen
-        </button>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">FF</div>
+        <div><strong>FollowFlow</strong><span>ClientController</span></div>
       </div>
 
-      <div v-if="status" class="meta-list">
-        <p><strong>Last successful:</strong> {{ status.config.last_successful_server }}</p>
-        <p><strong>Environment:</strong> {{ status.config.environment }}</p>
-        <p><strong>Rebind erlaubt:</strong> {{ status.config.allow_server_rebind ? "Ja" : "Nein" }}</p>
-        <p><strong>API-Key vorhanden:</strong> {{ status.config.api_key ? "Ja" : "Nein" }}</p>
-        <p><strong>ADB Quelle:</strong> {{ status.adb_source }}</p>
-        <p><strong>Config Pfad:</strong> {{ status.config_path }}</p>
-      </div>
-    </section>
-
-    <section v-if="activeTab === 'sync'" class="card">
-      <h2>Geräte & Server-Sync</h2>
-      <div class="actions-grid">
-        <button class="btn subtle" @click="discoverDevices" :disabled="isBusy">
-          <span v-if="busy.discover" class="spinner"></span>
-          Profile erfassen (ADB-Scan)
-        </button>
-        <button class="btn" @click="syncDevicesRemote" :disabled="isBusy">
-          <span v-if="busy.syncDevices" class="spinner"></span>
-          Geräte zu Server syncen
-        </button>
-        <button class="btn secondary" @click="installWindowsDriver" :disabled="isBusy">
-          <span v-if="busy.installDriver" class="spinner"></span>
-          Windows ADB-Treiber installieren
-        </button>
+      <div class="node-state">
+        <span :class="['state-dot', { online }]"></span>
+        <div><strong>{{ online ? "Verbunden" : "Nicht registriert" }}</strong><span>v{{ status?.app_version || "–" }}</span></div>
       </div>
 
-      <ul v-if="localDevices.length > 0" class="device-list">
-        <li v-for="d in localDevices" :key="d.device_uuid" class="device-item">
-          <div class="device-icon-wrap">
-            <span class="device-icon">📱</span>
-            <span v-if="scansActive && nextScanInSeconds !== null" class="countdown-badge">{{ nextScanInSeconds }}s</span>
-          </div>
-
-          <div class="device-content">
-            <div class="device-title-row">
-              <strong>{{ d.name || "Unbenanntes Gerät" }}</strong>
-              <span class="status-pill">{{ d.status }}</span>
-            </div>
-            <div class="device-meta">
-              <span><strong>UUID:</strong> <code>{{ d.device_uuid }}</code></span>
-              <span><strong>ADB:</strong> {{ d.adb_serial || "-" }}</span>
-              <span><strong>Platform:</strong> {{ d.platform || "-" }}</span>
-              <span><strong>Last Seen:</strong> {{ d.last_seen_at }}</span>
-            </div>
-          </div>
-        </li>
-      </ul>
-      <p v-else>Keine lokalen Geräte erkannt.</p>
-    </section>
-
-    <section v-if="activeTab === 'outbox'" class="card">
-      <h2>Lokale Outbox (Store-and-Forward)</h2>
-      <div class="column">
-        <input v-model="testEventType" placeholder="event type" />
-        <textarea v-model="testPayload" rows="4"></textarea>
-        <button class="btn" @click="queueTestEvent" :disabled="isBusy">
-          <span v-if="busy.queueEvent" class="spinner"></span>
-          Test-Event lokal speichern
+      <nav class="menu">
+        <button v-for="page in pages" :key="page.key" :class="['menu-item', { active: activePage === page.key }]" @click="activePage = page.key">
+          <span class="menu-icon">{{ page.icon }}</span><span>{{ page.label }}</span>
+          <span v-if="page.key === 'processes' && status?.running_processes" class="menu-badge">{{ status.running_processes }}</span>
+          <span v-if="page.key === 'outbox' && status?.pending_events" class="menu-badge">{{ status.pending_events }}</span>
         </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span>Node UUID</span><code>{{ status?.config.node_uuid || "–" }}</code>
       </div>
+    </aside>
 
-      <table v-if="pendingEvents.length > 0" class="events-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Typ</th>
-            <th>Payload</th>
-            <th>Zeit</th>
-            <th>Aktion</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="evt in pendingEvents" :key="evt.id">
-            <td>{{ evt.id }}</td>
-            <td>{{ evt.event_type }}</td>
-            <td><code>{{ evt.payload_json }}</code></td>
-            <td>{{ evt.created_at }}</td>
-            <td>
-              <button class="btn secondary" @click="markAsSent(evt.id)" :disabled="isBusy">
-                <span v-if="busy[`mark-${evt.id}`]" class="spinner tiny"></span>
-                Als gesendet markieren
-              </button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <p v-else>Keine pending Events.</p>
-    </section>
+    <main class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow">Node Console</p><h1>{{ pages.find((page) => page.key === activePage)?.label }}</h1></div>
+        <div class="top-actions"><button class="button ghost" :disabled="isBusy" @click="refresh()">Aktualisieren</button><button class="button primary" :disabled="isBusy" @click="runAutopilot"><span v-if="busy === 'cycle'" class="spinner"></span>Jetzt synchronisieren</button></div>
+      </header>
 
-    <section v-if="activeTab === 'settings'" class="card">
-      <h2>Server-Bindung & Rebind</h2>
+      <div :class="['feedback', feedbackType]">{{ feedback }}</div>
 
-      <div class="column block">
-        <label>Server-Domain</label>
-        <input v-model="newServerDomain" placeholder="https://factory.follow-flow.de" />
-        <button class="btn" @click="saveServerDomain" :disabled="isBusy">
-          <span v-if="busy.saveDomain" class="spinner"></span>
-          Domain speichern
-        </button>
-      </div>
+      <template v-if="activePage === 'overview'">
+        <section class="hero-card">
+          <div><p class="eyebrow light">Autopilot</p><h2>Node ist bereit für Remote-Aufträge</h2><p>Registrierung, Heartbeat, Geräte-Sync und freigegebene Updates laufen über den Hintergrunddienst.</p></div>
+          <div class="hero-status"><span>Letzter manueller Lauf</span><strong>{{ lastCycleAt }}</strong><small>{{ lastCycleSummary }}</small></div>
+        </section>
 
-      <div class="column block">
-        <label>Rebind (MVP-Test)</label>
-        <input v-model="rebindNewDomain" placeholder="https://factory.follow-flow.de" />
-        <input v-model="rebindExpiresAt" placeholder="2026-06-10T18:00:00Z" />
-        <input v-model="rebindSignature" placeholder="signature" />
-        <button class="btn secondary" @click="applyRebind" :disabled="isBusy">
-          <span v-if="busy.rebind" class="spinner"></span>
-          Rebind anwenden
-        </button>
-      </div>
-    </section>
+        <section class="stats-grid">
+          <article class="metric"><span>Client-Version</span><strong>v{{ status?.app_version || "–" }}</strong><small>{{ status?.updater_available ? "Signierter Updater aktiv" : "Updater nicht verfügbar" }}</small></article>
+          <article class="metric"><span>Lokale Geräte</span><strong>{{ status?.local_devices ?? 0 }}</strong><small>{{ status?.adb_available ? `ADB: ${status.adb_source}` : "ADB nicht verfügbar" }}</small></article>
+          <article class="metric"><span>Aktive Prozesse</span><strong>{{ status?.running_processes ?? 0 }}</strong><small>{{ runtimeReady ? "Workflow-Runtime bereit" : "Runtime unvollständig" }}</small></article>
+          <article class="metric"><span>Outbox</span><strong>{{ status?.pending_events ?? 0 }}</strong><small>Ausstehende Ereignisse</small></article>
+        </section>
 
-    <p :class="['feedback', feedbackType]">{{ feedback }}</p>
+        <section class="panel">
+          <div class="panel-heading"><div><h2>Schnellaktionen</h2><p>Manuelle Diagnose- und Synchronisationsaktionen.</p></div></div>
+          <div class="action-grid"><button class="action-card" @click="registerNode" :disabled="isBusy"><span>01</span><strong>Node registrieren</strong><small>API-Schlüssel vom Server beziehen</small></button><button class="action-card" @click="sendHeartbeat" :disabled="isBusy"><span>02</span><strong>Heartbeat senden</strong><small>Version und Fähigkeiten melden</small></button><button class="action-card" @click="discoverDevices" :disabled="isBusy"><span>03</span><strong>Geräte erkennen</strong><small>Lokalen ADB-Scan starten</small></button><button class="action-card" @click="syncDevices" :disabled="isBusy"><span>04</span><strong>Geräte synchronisieren</strong><small>Inventar an AiUserFactory senden</small></button></div>
+        </section>
+      </template>
 
-    <div v-if="isBusy" class="loading-overlay">
-      <div class="loading-box">
-        <span class="spinner large"></span>
-        <p>Bitte warten…</p>
-      </div>
-    </div>
-  </main>
+      <section v-else-if="activePage === 'devices'" class="panel">
+        <div class="panel-heading"><div><h2>Android-Geräte</h2><p>Direkt am Node erkanntes Geräte-Inventar.</p></div><div class="top-actions"><button class="button ghost" @click="discoverDevices" :disabled="isBusy">ADB-Scan</button><button class="button primary" @click="syncDevices" :disabled="isBusy">Zum Server syncen</button></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Gerät</th><th>Plattform</th><th>ADB</th><th>Status</th><th>Zuletzt gesehen</th></tr></thead><tbody><tr v-for="device in devices" :key="device.device_uuid"><td><strong>{{ device.name }}</strong><code>{{ device.device_uuid }}</code></td><td>{{ device.platform }}</td><td><code>{{ device.adb_serial || "–" }}</code></td><td><span :class="['pill', device.status]">{{ device.status }}</span></td><td>{{ device.last_seen_at }}</td></tr><tr v-if="!devices.length"><td colspan="5" class="empty">Keine Geräte erkannt.</td></tr></tbody></table></div>
+      </section>
+
+      <section v-else-if="activePage === 'processes'" class="panel">
+        <div class="panel-heading"><div><h2>Prozesse auf diesem Node</h2><p>ClientController-verwaltete Remote-Jobs und Workflow-Prozesse. Die Liste aktualisiert sich alle fünf Sekunden.</p></div><span class="live-indicator"><i></i> Live</span></div>
+        <div class="process-list"><article v-for="process in processes" :key="process.id" class="process-row"><div :class="['process-icon', process.status]">{{ process.status === 'running' ? '▶' : process.status === 'success' ? '✓' : '!' }}</div><div class="process-main"><div class="process-title"><strong>{{ process.job_type }}</strong><span :class="['pill', process.status]">{{ process.status }}</span></div><code>{{ process.job_id || `local-${process.id}` }}</code><details><summary>Details</summary><pre>{{ readableDetails(process.details_json) }}</pre></details></div><time>{{ process.created_at }}</time></article><div v-if="!processes.length" class="empty-card">Noch keine verwalteten Prozesse vorhanden.</div></div>
+      </section>
+
+      <section v-else-if="activePage === 'outbox'" class="panel">
+        <div class="panel-heading"><div><h2>Store-and-Forward Outbox</h2><p>Lokale Ereignisse, die noch nicht bestätigt wurden.</p></div></div>
+        <div class="form-grid"><input v-model="eventType" placeholder="Event-Typ"><textarea v-model="eventPayload" rows="3"></textarea><button class="button primary" @click="queueEvent" :disabled="isBusy">Event speichern</button></div>
+        <div class="event-list"><article v-for="event in events" :key="event.id"><div><strong>{{ event.event_type }}</strong><span>#{{ event.id }} · {{ event.created_at }}</span></div><code>{{ event.payload_json }}</code><button class="button ghost small" @click="markEventSent(event.id)">Als gesendet markieren</button></article><div v-if="!events.length" class="empty-card">Die Outbox ist leer.</div></div>
+      </section>
+
+      <section v-else class="settings-grid">
+        <article class="panel"><div class="panel-heading"><div><h2>Server-Bindung</h2><p>Zentrale AiUserFactory-Instanz für diesen Node.</p></div></div><label>Server-Domain</label><input v-model="serverDomain" placeholder="https://factory.follow-flow.de"><button class="button primary" @click="saveServerDomain" :disabled="isBusy">Domain speichern</button></article>
+        <article class="panel"><div class="panel-heading"><div><h2>Lokale Laufzeit</h2><p>Diagnosepfade und verfügbare Komponenten.</p></div></div><dl><div><dt>Umgebung</dt><dd>{{ status?.config.environment || "–" }}</dd></div><div><dt>Datenbank</dt><dd><code>{{ status?.db_path || "–" }}</code></dd></div><div><dt>Konfiguration</dt><dd><code>{{ status?.config_path || "–" }}</code></dd></div><div><dt>Workflow-Runtime</dt><dd><code>{{ status?.workflow_runtime_path || "nicht gefunden" }}</code></dd></div><div><dt>Rebind erlaubt</dt><dd>{{ status?.config.allow_server_rebind ? "Ja" : "Nein" }}</dd></div></dl></article>
+      </section>
+
+      <div v-if="isBusy" class="busy-overlay"><div><span class="spinner large"></span><p>Aktion wird ausgeführt …</p></div></div>
+    </main>
+  </div>
 </template>
 
 <style scoped>
-.container {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 1.4rem;
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  color: #20222a;
-}
-
-.header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-  background: #ffffff;
-  border: 1px solid #e7ecf6;
-  border-radius: 12px;
-  padding: 0.95rem;
-}
-
-.row {
-  display: flex;
-  gap: 0.5rem;
-}
-
-h1 {
-  margin: 0;
-}
-
-.subtitle {
-  margin: 0.2rem 0 0;
-  color: #5f6372;
-}
-
-.autopilot-strip {
-  margin: 0.85rem 0;
-  border: 1px solid #dce5ff;
-  background: #f7f9ff;
-  border-radius: 10px;
-  padding: 0.65rem 0.8rem;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1rem;
-  font-size: 0.92rem;
-}
-
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 0.75rem;
-  margin: 1rem 0;
-}
-
-.stat-card {
-  background: #fff;
-  border: 1px solid #e5e9f3;
-  border-radius: 10px;
-  padding: 0.75rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-}
-
-.stat-card span {
-  color: #6a7082;
-  font-size: 0.82rem;
-}
-
-.stat-card strong {
-  font-size: 0.95rem;
-}
-
-.ok {
-  color: #0b8f4f;
-}
-
-.bad {
-  color: #b42318;
-}
-
-.legacy-warning {
-  margin: 0.5rem 0 1rem;
-  border: 1px solid #fedf89;
-  background: #fffaeb;
-  color: #7a2e0e;
-  border-radius: 10px;
-  padding: 0.75rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-bottom: 0.8rem;
-}
-
-.tab {
-  border-radius: 999px;
-  border: 1px solid #d6dcef;
-  background: #f6f8ff;
-  color: #394057;
-  padding: 0.45rem 0.9rem;
-  cursor: pointer;
-}
-
-.tab.active {
-  background: #355ad4;
-  border-color: #355ad4;
-  color: #fff;
-}
-
-.card {
-  border: 1px solid #dfe5f2;
-  border-radius: 12px;
-  padding: 1rem;
-  background: #fff;
-  margin-bottom: 1rem;
-}
-
-.actions-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 0.55rem;
-  margin-bottom: 0.85rem;
-}
-
-.meta-list p {
-  margin: 0.25rem 0;
-  font-size: 0.92rem;
-}
-
-.column {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.block {
-  margin-bottom: 1rem;
-}
-
-.mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-}
-
-input,
-textarea,
-button {
-  border-radius: 10px;
-  border: 1px solid #cfd6e6;
-  padding: 0.58rem 0.8rem;
-  font-size: 0.94rem;
-}
-
-textarea {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-}
-
-.btn {
-  cursor: pointer;
-  background: #2f55d4;
-  border-color: #2f55d4;
-  color: #fff;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.45rem;
-}
-
-.btn.secondary {
-  background: #eef2ff;
-  border-color: #cdd8ff;
-  color: #243b84;
-}
-
-.btn.subtle {
-  background: #f3f4f8;
-  border-color: #dde2ec;
-  color: #2f3b59;
-}
-
-.btn.danger {
-  background: #e5484d;
-  border-color: #e5484d;
-  color: #fff;
-}
-
-button:disabled {
-  opacity: 0.65;
-  cursor: not-allowed;
-}
-
-.device-list {
-  list-style: none;
-  margin: 0.7rem 0 0;
-  padding: 0;
-  display: grid;
-  gap: 0.65rem;
-}
-
-.device-item {
-  border: 1px solid #e8edf7;
-  border-radius: 12px;
-  background: #fbfcff;
-  padding: 0.7rem;
-  display: flex;
-  gap: 0.75rem;
-}
-
-.device-icon-wrap {
-  position: relative;
-  width: 36px;
-  height: 36px;
-  display: grid;
-  place-items: center;
-  background: #eef2ff;
-  border: 1px solid #d6def8;
-  border-radius: 10px;
-  flex-shrink: 0;
-}
-
-.device-icon {
-  font-size: 1.1rem;
-  line-height: 1;
-}
-
-.countdown-badge {
-  position: absolute;
-  right: -8px;
-  top: -8px;
-  background: #2f55d4;
-  color: #fff;
-  border-radius: 999px;
-  padding: 0.08rem 0.35rem;
-  font-size: 0.66rem;
-  font-weight: 700;
-  border: 1px solid #fff;
-}
-
-.device-content {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-}
-
-.device-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.6rem;
-}
-
-.status-pill {
-  border: 1px solid #d5dcf3;
-  background: #f3f6ff;
-  color: #304a92;
-  border-radius: 999px;
-  padding: 0.12rem 0.5rem;
-  font-size: 0.75rem;
-  white-space: nowrap;
-}
-
-.device-meta {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 0.35rem 0.8rem;
-  font-size: 0.87rem;
-  color: #4a5062;
-}
-
-.events-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-top: 0.7rem;
-}
-
-.events-table th,
-.events-table td {
-  border: 1px solid #e9edf6;
-  padding: 0.5rem;
-  vertical-align: top;
-  text-align: left;
-  font-size: 0.9rem;
-}
-
-.feedback {
-  margin-top: 0.2rem;
-  font-weight: 600;
-  border-radius: 8px;
-  padding: 0.55rem 0.7rem;
-}
-
-.feedback.info {
-  background: #eef4ff;
-  color: #274690;
-}
-
-.feedback.success {
-  background: #ecfdf3;
-  color: #067647;
-}
-
-.feedback.error {
-  background: #fef3f2;
-  color: #b42318;
-}
-
-.loading-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(20, 24, 34, 0.22);
-  display: grid;
-  place-items: center;
-  z-index: 50;
-}
-
-.loading-box {
-  background: #fff;
-  border: 1px solid #dfe5f2;
-  border-radius: 12px;
-  padding: 1rem 1.2rem;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.6rem;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
-}
-
-.spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(255, 255, 255, 0.45);
-  border-top-color: #fff;
-  border-radius: 50%;
-  display: inline-block;
-  animation: spin 0.8s linear infinite;
-}
-
-.spinner.tiny {
-  width: 12px;
-  height: 12px;
-}
-
-.spinner.large {
-  width: 24px;
-  height: 24px;
-  border-width: 3px;
-  border-color: #d0d9f6;
-  border-top-color: #2f55d4;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+:global(*){box-sizing:border-box}:global(body){margin:0;background:#f4f7fb;color:#172033;font-family:Inter,"Segoe UI",sans-serif}:global(button),:global(input),:global(textarea){font:inherit}.app-shell{min-height:100vh;display:grid;grid-template-columns:260px minmax(0,1fr)}.sidebar{position:fixed;inset:0 auto 0 0;width:260px;display:flex;flex-direction:column;padding:22px 16px;background:#0b1220;color:#fff;border-right:1px solid #1d293b}.brand{display:flex;align-items:center;gap:12px;padding:0 8px 22px}.brand-mark{display:grid;width:42px;height:42px;place-items:center;border-radius:12px;background:linear-gradient(135deg,#06b6d4,#2563eb);font-weight:900}.brand strong,.brand span{display:block}.brand span{margin-top:2px;font-size:12px;color:#8794aa}.node-state{display:flex;align-items:center;gap:10px;margin:0 4px 20px;padding:12px;border:1px solid #243044;border-radius:12px;background:#111b2d}.node-state strong,.node-state span{display:block;font-size:12px}.node-state span{color:#8b98ad}.state-dot{width:9px;height:9px;border-radius:50%;background:#64748b;box-shadow:0 0 0 4px #64748b22}.state-dot.online{background:#34d399;box-shadow:0 0 0 4px #34d39922}.menu{display:grid;gap:5px}.menu-item{position:relative;display:flex;align-items:center;gap:12px;width:100%;padding:11px 13px;border:0;border-radius:10px;background:transparent;color:#9ba8bc;text-align:left;cursor:pointer}.menu-item:hover{background:#152136;color:#fff}.menu-item.active{background:linear-gradient(90deg,#1d4ed8,#2563eb);color:#fff;box-shadow:0 8px 20px #1d4ed833}.menu-icon{width:20px;text-align:center;font-size:18px}.menu-badge{margin-left:auto!important;display:grid!important;min-width:20px;height:20px;place-items:center;border-radius:10px;background:#ffffff24;color:#fff!important;font-size:10px!important;font-weight:800}.sidebar-footer{margin-top:auto;padding:16px 8px 4px;border-top:1px solid #223047}.sidebar-footer span,.sidebar-footer code{display:block}.sidebar-footer span{margin-bottom:5px;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#64748b}.sidebar-footer code{overflow:hidden;color:#94a3b8;font-size:10px;text-overflow:ellipsis}.workspace{grid-column:2;min-width:0;padding:26px 30px 40px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:18px}.eyebrow{margin:0 0 5px;color:#2563eb;font-size:10px;font-weight:800;letter-spacing:.19em;text-transform:uppercase}.eyebrow.light{color:#67e8f9}.topbar h1{margin:0;font-size:26px}.top-actions{display:flex;gap:9px}.button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:9px;padding:10px 15px;font-size:13px;font-weight:700;cursor:pointer}.button:disabled{opacity:.55;cursor:not-allowed}.button.primary{background:#2563eb;color:#fff;box-shadow:0 7px 15px #2563eb25}.button.ghost{border:1px solid #d8e0eb;background:#fff;color:#475569}.button.small{padding:7px 10px;font-size:11px}.feedback{margin-bottom:18px;padding:11px 14px;border:1px solid #dbe4ef;border-radius:9px;background:#fff;color:#475569;font-size:12px}.feedback.success{border-color:#a7f3d0;background:#ecfdf5;color:#047857}.feedback.error{border-color:#fecaca;background:#fef2f2;color:#b91c1c}.hero-card{display:flex;align-items:center;justify-content:space-between;gap:30px;padding:28px;border-radius:17px;background:radial-gradient(circle at 85% 15%,#164e63 0,transparent 35%),linear-gradient(135deg,#0f172a,#111827);color:#fff;box-shadow:0 18px 35px #0f172a20}.hero-card h2{margin:4px 0 8px;font-size:24px}.hero-card p{max-width:680px;margin:0;color:#aebbd0;font-size:13px;line-height:1.6}.hero-status{width:250px;padding:15px;border:1px solid #ffffff1f;border-radius:12px;background:#ffffff0d}.hero-status span,.hero-status strong,.hero-status small{display:block}.hero-status span{font-size:10px;color:#93a4ba;text-transform:uppercase}.hero-status strong{margin:4px 0;font-size:20px}.hero-status small{overflow:hidden;color:#93a4ba;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:18px 0}.metric,.panel{border:1px solid #dfe6ef;border-radius:14px;background:#fff;box-shadow:0 6px 18px #17203308}.metric{padding:18px}.metric span,.metric strong,.metric small{display:block}.metric span{color:#64748b;font-size:11px;font-weight:700}.metric strong{margin:7px 0 4px;font-size:25px}.metric small{color:#94a3b8;font-size:10px}.panel{padding:20px}.panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px}.panel-heading h2{margin:0;font-size:17px}.panel-heading p{margin:4px 0 0;color:#738096;font-size:12px}.action-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.action-card{padding:16px;border:1px solid #e1e7ef;border-radius:11px;background:#f9fbfd;text-align:left;cursor:pointer}.action-card:hover{border-color:#93c5fd;background:#eff6ff;transform:translateY(-1px)}.action-card span,.action-card strong,.action-card small{display:block}.action-card span{margin-bottom:18px;color:#2563eb;font:700 11px monospace}.action-card strong{font-size:13px}.action-card small{margin-top:5px;color:#8390a4;font-size:10px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th{padding:10px 12px;background:#f8fafc;color:#64748b;font-size:10px;text-align:left;text-transform:uppercase}td{padding:13px 12px;border-top:1px solid #edf1f6;font-size:12px}td strong,td code{display:block}td code{margin-top:4px;color:#7c8ba1;font-size:10px}.pill{display:inline-flex;border-radius:99px;padding:4px 8px;background:#e2e8f0;color:#475569;font-size:9px;font-weight:800;text-transform:uppercase}.pill.online,.pill.success{background:#d1fae5;color:#047857}.pill.running,.pill.busy{background:#dbeafe;color:#1d4ed8}.pill.failed,.pill.error{background:#fee2e2;color:#b91c1c}.empty{padding:35px;text-align:center;color:#94a3b8}.process-list,.event-list{display:grid;gap:9px}.process-row{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:13px;align-items:start;padding:14px;border:1px solid #e4eaf2;border-radius:11px}.process-icon{display:grid;width:38px;height:38px;place-items:center;border-radius:10px;background:#e2e8f0;color:#475569;font-weight:900}.process-icon.running{background:#dbeafe;color:#2563eb}.process-icon.success{background:#d1fae5;color:#059669}.process-icon.failed{background:#fee2e2;color:#dc2626}.process-title{display:flex;align-items:center;gap:9px}.process-main>code{display:block;margin:4px 0;color:#8996aa;font-size:10px}.process-row time{color:#94a3b8;font-size:10px}.process-row details{margin-top:7px}.process-row summary{color:#64748b;font-size:10px;cursor:pointer}.process-row pre{max-height:180px;overflow:auto;padding:10px;border-radius:8px;background:#0f172a;color:#cbd5e1;font-size:10px;white-space:pre-wrap}.live-indicator{display:flex;align-items:center;gap:6px;color:#059669;font-size:11px;font-weight:700}.live-indicator i{width:7px;height:7px;border-radius:50%;background:#10b981;box-shadow:0 0 0 4px #10b9811f}.empty-card{padding:35px;border:1px dashed #cbd5e1;border-radius:10px;color:#94a3b8;text-align:center;font-size:12px}.form-grid{display:grid;grid-template-columns:1fr 2fr auto;gap:10px;margin-bottom:17px}.event-list article{display:grid;grid-template-columns:180px minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px;border:1px solid #e4eaf2;border-radius:10px}.event-list strong,.event-list span{display:block}.event-list strong{font-size:12px}.event-list span{margin-top:3px;color:#94a3b8;font-size:9px}.event-list code{overflow:hidden;color:#64748b;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}label{display:block;margin:8px 0 6px;color:#475569;font-size:11px;font-weight:700}input,textarea{width:100%;border:1px solid #d5deea;border-radius:9px;padding:10px 12px;background:#fff;color:#1e293b;font-size:12px;outline:none}input:focus,textarea:focus{border-color:#60a5fa;box-shadow:0 0 0 3px #60a5fa20}.settings-grid .button{margin-top:12px}.settings-grid dl{display:grid;gap:12px;margin:0}.settings-grid dl div{display:grid;grid-template-columns:130px minmax(0,1fr);gap:12px}.settings-grid dt{color:#64748b;font-size:11px}.settings-grid dd{min-width:0;margin:0;font-size:11px}.settings-grid dd code{display:block;overflow:hidden;color:#475569;text-overflow:ellipsis;white-space:nowrap}.busy-overlay{position:fixed;inset:0 0 0 260px;display:grid;z-index:50;place-items:center;background:#0f172a30;backdrop-filter:blur(2px)}.busy-overlay>div{padding:22px 30px;border-radius:13px;background:#fff;box-shadow:0 20px 50px #0f172a30;text-align:center}.busy-overlay p{margin:10px 0 0;font-size:12px}.spinner{width:14px;height:14px;border:2px solid #ffffff55;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}.spinner.large{display:inline-block;width:26px;height:26px;border-color:#dbeafe;border-top-color:#2563eb}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:1000px){.app-shell{grid-template-columns:210px minmax(0,1fr)}.sidebar{width:210px}.workspace{padding:20px}.stats-grid,.action-grid{grid-template-columns:repeat(2,1fr)}.busy-overlay{left:210px}.settings-grid{grid-template-columns:1fr}}@media(max-width:720px){.app-shell{display:block}.sidebar{position:static;width:auto;min-height:auto}.menu{grid-template-columns:repeat(5,1fr)}.menu-item{justify-content:center;padding:9px}.menu-item>span:not(.menu-icon){display:none}.sidebar-footer,.node-state{display:none}.workspace{grid-column:auto;padding:15px}.topbar,.hero-card{align-items:flex-start;flex-direction:column}.stats-grid,.action-grid{grid-template-columns:1fr 1fr}.form-grid,.event-list article{grid-template-columns:1fr}.busy-overlay{left:0}}
 </style>
-
-
