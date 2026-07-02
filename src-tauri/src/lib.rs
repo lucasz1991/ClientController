@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tar::Archive;
@@ -1517,6 +1517,75 @@ fn report_job_result_remote(
     Ok(())
 }
 
+fn report_job_progress_remote(
+    app: &tauri::AppHandle,
+    job_uuid: &str,
+    status_path: &Path,
+    screenshot_path: &Path,
+    include_screenshot: bool,
+) -> Result<bool, String> {
+    let raw_status = match fs::read_to_string(status_path) {
+        Ok(raw_status) => raw_status,
+        Err(_) => return Ok(false),
+    };
+    let progress: Value = match serde_json::from_str::<Value>(&raw_status) {
+        Ok(progress) if progress.is_object() => progress,
+        _ => return Ok(false),
+    };
+    let cfg = load_or_create_config(app)?;
+    let endpoint = format!(
+        "{}/api/client-controller/job-progress",
+        base_url(&cfg.server_domain)
+    );
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .text("job_uuid", job_uuid.to_string())
+        .text("progress", progress.to_string());
+
+    if include_screenshot && screenshot_path.is_file() {
+        let screenshot = fs::read(screenshot_path)
+            .map_err(|e| format!("read workflow screenshot failed: {e}"))?;
+        let part = reqwest::blocking::multipart::Part::bytes(screenshot)
+            .file_name("live.png")
+            .mime_str("image/png")
+            .map_err(|e| format!("build workflow screenshot upload failed: {e}"))?;
+        form = form.part("screenshot", part);
+    }
+
+    let response = http_client()?
+        .post(endpoint)
+        .header("X-NODE-API-KEY", cfg.api_key)
+        .multipart(form)
+        .send()
+        .map_err(|e| format!("job progress request failed: {e}"))?;
+    let status_code = response.status();
+    let raw_body = response
+        .text()
+        .map_err(|e| format!("job progress response read failed: {e}"))?;
+    let response_body: Value = serde_json::from_str(&raw_body).map_err(|e| {
+        format!(
+            "job progress response parse failed: {} (HTTP {}, body: {})",
+            e,
+            status_code.as_u16(),
+            preview_body(&raw_body, 500)
+        )
+    })?;
+
+    if !status_code.is_success()
+        || !response_body
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "job progress failed: HTTP {} - {}",
+            status_code.as_u16(),
+            response_body
+        ));
+    }
+
+    Ok(true)
+}
+
 fn start_local_job_execution(app: &tauri::AppHandle, job: &RemoteJob) -> Result<i64, String> {
     init_db(app)?;
     let conn = open_db(app)?;
@@ -1630,6 +1699,38 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     )
     .map_err(|e| format!("write workflow runtime failed: {e}"))?;
 
+    let live_preview_enabled = runtime
+        .get("livePreviewEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let progress_interval_seconds = runtime
+        .get("livePreviewPollIntervalSeconds")
+        .or_else(|| runtime.get("livePreviewIntervalSeconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(3)
+        .clamp(1, 60);
+    let initial_status = json!({
+        "runId": runtime.get("runId").cloned().unwrap_or_else(|| json!(job.job_uuid)),
+        "workflow": runtime.get("workflow").cloned().unwrap_or_else(|| json!({})),
+        "state": "running",
+        "stage": "client-controller-process-started",
+        "message": "Workflow-Task-Prozess wurde auf dem ClientController gestartet.",
+        "isRunning": true,
+        "livePreviewEnabled": live_preview_enabled,
+        "livePreviewIntervalSeconds": progress_interval_seconds,
+        "livePreviewPollIntervalSeconds": progress_interval_seconds,
+        "tasks": runtime.get("tasks").cloned().unwrap_or_else(|| json!([])),
+        "events": [],
+        "browserWindows": [],
+        "at": now_iso(),
+    });
+    fs::write(
+        &status_path,
+        serde_json::to_vec_pretty(&initial_status)
+            .map_err(|e| format!("serialize initial workflow status failed: {e}"))?,
+    )
+    .map_err(|e| format!("write initial workflow status failed: {e}"))?;
+
     let script = execution_runtime_root
         .join("node")
         .join("workflows")
@@ -1652,9 +1753,50 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         command.env("TZ", timezone).env("APP_TIMEZONE", timezone);
     }
 
-    let output = command
-        .output()
+    let stdout_path = run_dir.join("stdout.log");
+    let stderr_path = run_dir.join("stderr.log");
+    let stdout = fs::File::create(&stdout_path)
+        .map_err(|e| format!("create workflow stdout log failed: {e}"))?;
+    let stderr = fs::File::create(&stderr_path)
+        .map_err(|e| format!("create workflow stderr log failed: {e}"))?;
+    let mut child = command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
         .map_err(|e| format!("start workflow task process failed: {e}"))?;
+    let output_status = loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("poll workflow task process failed: {e}"))?
+        {
+            Some(status) => break status,
+            None => {
+                let _ = report_job_progress_remote(
+                    app,
+                    &job.job_uuid,
+                    &status_path,
+                    &preview_path,
+                    live_preview_enabled,
+                );
+                std::thread::sleep(Duration::from_secs(progress_interval_seconds));
+            }
+        }
+    };
+
+    if let Err(error) = report_job_progress_remote(
+        app,
+        &job.job_uuid,
+        &status_path,
+        &preview_path,
+        live_preview_enabled,
+    ) {
+        let _ = queue_local_event(
+            app,
+            "job_progress_failed",
+            json!({ "job_uuid": job.job_uuid, "error": error }),
+        );
+    }
+
     let result = fs::read_to_string(&result_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
@@ -1701,10 +1843,10 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
             .to_string());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     Err(format!(
         "workflow task returned no result (exit {:?}): {}",
-        output.status.code(),
+        output_status.code(),
         preview_body(&stderr, 2000)
     ))
 }
