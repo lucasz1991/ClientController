@@ -12,15 +12,27 @@ permissions:
 jobs:
   publish-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ClientController
     steps:
-      - name: Checkout
+      - name: Checkout ClientController
         uses: actions/checkout@v4
+        with:
+          path: ClientController
+
+      - name: Checkout AiUserFactory workflow runtime
+        uses: actions/checkout@v4
+        with:
+          repository: lucasz1991/AiUserFactory
+          path: AiUserFactory
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: ClientController/package-lock.json
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -28,7 +40,7 @@ jobs:
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: ClientController/src-tauri
 
       - name: Install frontend dependencies
         run: npm ci
@@ -40,6 +52,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          projectPath: ClientController
           tagName: v__VERSION__
           releaseName: ClientController v__VERSION__
           releaseBody: Signed FollowFlow ClientController update.
