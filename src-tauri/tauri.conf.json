@@ -1,10 +1,10 @@
 {
     "$schema":  "https://schema.tauri.app/config/2",
     "productName":  "clientcontroller",
-    "version":  "0.1.0",
+    "version":  "0.1.1",
     "identifier":  "de.followflow.clientcontroller",
     "build":  {
-                  "beforeDevCommand":  "npm run sync:workflow-runtime && npm run dev",
+                  "beforeDevCommand":  "npm run prepare:workflow-runtime && npm run dev",
                   "devUrl":  "http://localhost:1420",
                   "beforeBuildCommand":  "npm run install:workflow-runtime && npm run build",
                   "frontendDist":  "../dist"

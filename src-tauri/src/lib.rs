@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::Manager;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use flate2::read::GzDecoder;
 use tar::Archive;
 
@@ -1163,32 +1163,6 @@ fn sync_devices_remote_internal(app: &tauri::AppHandle) -> Result<usize, String>
     Ok(count)
 }
 
-fn resolve_node_binary() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if cfg!(target_os = "windows") {
-        candidates.push(PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
-        candidates.push(PathBuf::from(r"C:\Program Files (x86)\nodejs\node.exe"));
-    } else {
-        candidates.extend([
-            PathBuf::from("/usr/bin/node"),
-            PathBuf::from("/usr/local/bin/node"),
-            PathBuf::from("/usr/bin/nodejs"),
-        ]);
-    }
-
-    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
-        return Some(path);
-    }
-
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|_| PathBuf::from("node"))
-}
-
 fn bundled_workflow_node_binary(runtime_root: &Path) -> Option<PathBuf> {
     let name = if cfg!(target_os = "windows") { "node.exe" } else { "node" };
     let binary = runtime_root.join("bin").join(name);
@@ -1196,15 +1170,32 @@ fn bundled_workflow_node_binary(runtime_root: &Path) -> Option<PathBuf> {
     binary.is_file().then_some(binary)
 }
 
+fn bundled_cloakbrowser_binary(runtime_root: &Path) -> Option<PathBuf> {
+    let name = if cfg!(target_os = "windows") { "chrome.exe" } else { "chrome" };
+
+    find_file_recursive(&runtime_root.join(".cloakbrowser"), name)
+}
+
+fn workflow_modules_ready(modules_root: &Path) -> bool {
+    [
+        "puppeteer",
+        "puppeteer-core",
+        "puppeteer-extra",
+        "puppeteer-extra-plugin-stealth",
+        "cloakbrowser",
+    ]
+    .iter()
+    .all(|package| modules_root.join(package).join("package.json").is_file())
+}
+
 fn workflow_runtime_ready(app: &tauri::AppHandle) -> bool {
     let workflow_runtime = resolve_workflow_runtime(app);
 
-    workflow_runtime.is_some()
-        && workflow_runtime
-            .as_deref()
-            .and_then(bundled_workflow_node_binary)
-            .or_else(resolve_node_binary)
-            .is_some()
+    workflow_runtime.as_deref().is_some_and(|runtime_root| {
+        bundled_workflow_node_binary(runtime_root).is_some()
+            && bundled_cloakbrowser_binary(runtime_root).is_some()
+            && runtime_root.join("node_modules.tar.gz").is_file()
+    })
 }
 
 fn workflow_runtime_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
@@ -1240,32 +1231,33 @@ fn resolve_workflow_runtime(app: &tauri::AppHandle) -> Option<PathBuf> {
 fn ensure_workflow_dependencies(app: &tauri::AppHandle, runtime_root: &Path) -> Result<PathBuf, String> {
     let bundled_modules = runtime_root.join("node_modules");
 
-    if bundled_modules.is_dir() {
+    if workflow_modules_ready(&bundled_modules) {
         return Ok(bundled_modules);
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        for development_modules in [
-            cwd.join("node_modules"),
-            cwd.join("..").join("AiUserFactory").join("node_modules"),
-        ] {
-            if development_modules.join("puppeteer").is_dir() {
-                return Ok(development_modules);
-            }
-        }
     }
 
     let dependencies_root = ensure_runtime_dir(app)?.join("workflow-dependencies");
     let staged_modules = dependencies_root.join("node_modules");
-
-    if staged_modules.is_dir() {
-        return Ok(staged_modules);
-    }
-
     let archive_path = runtime_root.join("node_modules.tar.gz");
 
     if !archive_path.is_file() {
         return Err("workflow dependency archive was not found".to_string());
+    }
+
+    let archive_bytes = fs::read(&archive_path)
+        .map_err(|e| format!("read workflow dependency archive failed: {e}"))?;
+    let archive_fingerprint = hex::encode(Sha256::digest(&archive_bytes));
+    let fingerprint_path = dependencies_root.join(".archive-sha256");
+    let staged_fingerprint = fs::read_to_string(&fingerprint_path).unwrap_or_default();
+
+    if workflow_modules_ready(&staged_modules)
+        && staged_fingerprint.trim() == archive_fingerprint
+    {
+        return Ok(staged_modules);
+    }
+
+    if dependencies_root.exists() {
+        fs::remove_dir_all(&dependencies_root)
+            .map_err(|e| format!("remove stale workflow dependencies failed: {e}"))?;
     }
 
     fs::create_dir_all(&dependencies_root)
@@ -1278,23 +1270,50 @@ fn ensure_workflow_dependencies(app: &tauri::AppHandle, runtime_root: &Path) -> 
         .unpack(&dependencies_root)
         .map_err(|e| format!("extract workflow dependencies failed: {e}"))?;
 
-    if !staged_modules.is_dir() {
-        return Err("workflow dependency archive did not contain node_modules".to_string());
+    if !workflow_modules_ready(&staged_modules) {
+        return Err("workflow dependency archive is incomplete or missing required portable modules".to_string());
     }
+
+    fs::write(&fingerprint_path, archive_fingerprint)
+        .map_err(|e| format!("write workflow dependency fingerprint failed: {e}"))?;
 
     Ok(staged_modules)
 }
 
 fn workflow_node_path(app: &tauri::AppHandle, runtime_root: &Path) -> Result<std::ffi::OsString, String> {
-    let mut candidates = vec![ensure_workflow_dependencies(app, runtime_root)?];
+    std::env::join_paths([ensure_workflow_dependencies(app, runtime_root)?])
+        .map_err(|e| format!("build portable NODE_PATH failed: {e}"))
+}
 
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("node_modules"));
-        candidates.push(cwd.join("..").join("AiUserFactory").join("node_modules"));
+fn executable_workflow_runtime(
+    app: &tauri::AppHandle,
+    resource_runtime_root: &Path,
+) -> Result<PathBuf, String> {
+    let modules_root = ensure_workflow_dependencies(app, resource_runtime_root)?;
+
+    if modules_root == resource_runtime_root.join("node_modules") {
+        return Ok(resource_runtime_root.to_path_buf());
     }
 
-    let existing: Vec<PathBuf> = candidates.into_iter().filter(|path| path.is_dir()).collect();
-    std::env::join_paths(existing).map_err(|e| format!("build NODE_PATH failed: {e}"))
+    let staged_runtime_root = modules_root
+        .parent()
+        .ok_or_else(|| "portable workflow dependency root has no parent directory".to_string())?
+        .to_path_buf();
+
+    for directory in ["node", "resources"] {
+        copy_dir_recursive(
+            &resource_runtime_root.join(directory),
+            &staged_runtime_root.join(directory),
+        )?;
+    }
+
+    fs::copy(
+        resource_runtime_root.join("package.json"),
+        staged_runtime_root.join("package.json"),
+    )
+    .map_err(|e| format!("stage portable workflow package manifest failed: {e}"))?;
+
+    Ok(staged_runtime_root)
 }
 
 fn verify_job_signature(cfg: &ClientConfig, job: &RemoteJob) -> Result<(), String> {
@@ -1417,8 +1436,10 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     let runtime_root = resolve_workflow_runtime(app)
         .ok_or_else(|| "workflow runtime not found in application resources".to_string())?;
     let node_binary = bundled_workflow_node_binary(&runtime_root)
-        .or_else(resolve_node_binary)
-        .ok_or_else(|| "Node.js was not found on the ClientController node".to_string())?;
+        .ok_or_else(|| "bundled Node.js runtime is missing from ClientController resources".to_string())?;
+    let browser_binary = bundled_cloakbrowser_binary(&runtime_root)
+        .ok_or_else(|| "bundled CloakBrowser binary is missing from ClientController resources".to_string())?;
+    let execution_runtime_root = executable_workflow_runtime(app, &runtime_root)?;
     let mut runtime = job
         .payload
         .get("runtime")
@@ -1453,11 +1474,21 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     )
     .map_err(|e| format!("write workflow runtime failed: {e}"))?;
 
-    let script = runtime_root.join("node").join("workflows").join("run_step.cjs");
+    let script = execution_runtime_root.join("node").join("workflows").join("run_step.cjs");
     let mut command = Command::new(node_binary);
-    command.arg(script).arg(&config_path).current_dir(&runtime_root);
+    command
+        .arg(script)
+        .arg(&config_path)
+        .current_dir(&execution_runtime_root);
 
     command.env("NODE_PATH", workflow_node_path(app, &runtime_root)?);
+    command
+        .env("CLIENTCONTROLLER_PORTABLE_RUNTIME", "1")
+        .env("CLOAKBROWSER_CACHE_DIR", runtime_root.join(".cloakbrowser"))
+        .env("CLOAKBROWSER_BINARY_PATH", &browser_binary)
+        .env("PUPPETEER_EXECUTABLE_PATH", &browser_binary)
+        .env("MAIL_REGISTRATION_BROWSER_EXECUTABLE_PATH", &browser_binary)
+        .env("PUPPETEER_CACHE_DIR", runtime_root.join(".puppeteer-cache"));
     if let Some(timezone) = runtime.get("timezone").and_then(Value::as_str) {
         command.env("TZ", timezone).env("APP_TIMEZONE", timezone);
     }
@@ -1867,7 +1898,6 @@ fn get_client_status(app: tauri::AppHandle) -> Result<ClientStatus, String> {
     let node_available = workflow_runtime
         .as_deref()
         .and_then(bundled_workflow_node_binary)
-        .or_else(resolve_node_binary)
         .is_some();
 
     Ok(ClientStatus {

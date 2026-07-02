@@ -1,13 +1,14 @@
 {
   "name": "clientcontroller",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "sync:workflow-runtime": "node scripts/sync-workflow-runtime.mjs",
-    "install:workflow-runtime": "npm run sync:workflow-runtime && npm install --prefix src-tauri/resources/workflow-runtime --omit=dev && node scripts/package-workflow-runtime.mjs",
+    "prepare:workflow-runtime": "npm run sync:workflow-runtime && node scripts/install-workflow-runtime.mjs && node scripts/package-workflow-runtime.mjs",
+    "install:workflow-runtime": "npm run prepare:workflow-runtime",
     "preview": "vite preview",
     "tauri": "tauri"
   },
