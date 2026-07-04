@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flate2::read::GzDecoder;
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
@@ -21,6 +21,7 @@ const GOOGLE_USB_DRIVER_ZIP_URL: &str =
     "https://dl.google.com/android/repository/latest_usb_driver_windows.zip";
 static WINDOWS_DRIVER_INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static LOCAL_PROCESS_RECOVERY_PERFORMED: AtomicBool = AtomicBool::new(false);
+static WORKFLOW_JOB_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -132,6 +133,16 @@ struct RemoteJob {
     device_uuid: Option<String>,
     #[serde(default)]
     execution_scope: String,
+    #[serde(default = "default_payload_version")]
+    payload_version: u64,
+    #[serde(default)]
+    lease_token: String,
+    #[serde(default)]
+    lease_expires_at: Option<String>,
+}
+
+fn default_payload_version() -> u64 {
+    1
 }
 
 fn ensure_runtime_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -298,6 +309,14 @@ fn init_db(app: &tauri::AppHandle) -> Result<(), String> {
             sent_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS job_delivery_state (
+            job_uuid TEXT PRIMARY KEY,
+            lease_token TEXT NOT NULL DEFAULT '',
+            last_sequence INTEGER NOT NULL DEFAULT 0,
+            last_screenshot_hash TEXT,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS job_executions_local (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT,
@@ -336,6 +355,19 @@ fn init_db(app: &tauri::AppHandle) -> Result<(), String> {
         "#,
     )
     .map_err(|e| format!("init db schema failed: {e}"))?;
+
+    for column in [
+        "job_uuid TEXT",
+        "sequence INTEGER",
+        "next_attempt_at TEXT",
+        "last_error TEXT",
+        "screenshot_path TEXT",
+    ] {
+        let _ = conn.execute(
+            &format!("ALTER TABLE outbox_events ADD COLUMN {column}"),
+            [],
+        );
+    }
 
     if !LOCAL_PROCESS_RECOVERY_PERFORMED.swap(true, Ordering::SeqCst) {
         conn.execute(
@@ -904,6 +936,8 @@ fn register_node_remote_internal(
             "browser": workflow_ready,
             "cloakbrowser": workflow_ready,
             "workflow_tasks": workflow_ready,
+            "workflow_bundle_v1": workflow_ready,
+            "job_protocol_version": 2,
             "node_execution": true,
             "appium": false,
             "server_rebind": true,
@@ -963,7 +997,6 @@ fn register_node_remote_internal(
     cfg.api_key = api_key.to_string();
     cfg.last_successful_server = cfg.server_domain.clone();
     save_config(app, &cfg)?;
-    clear_outbox_internal(app)?;
 
     Ok(true)
 }
@@ -1019,6 +1052,8 @@ fn heartbeat_remote_internal(
             "browser": workflow_ready,
             "cloakbrowser": workflow_ready,
             "workflow_tasks": workflow_ready,
+            "workflow_bundle_v1": workflow_ready,
+            "job_protocol_version": 2,
             "node_execution": true,
             "server_rebind": true,
             "auto_update": true
@@ -1472,7 +1507,9 @@ fn report_job_result_remote(
     status: &str,
     result: Value,
     error_message: Option<String>,
-) -> Result<(), String> {
+    lease_token: &str,
+    sequence: i64,
+) -> Result<i64, String> {
     let cfg = load_or_create_config(app)?;
     let endpoint = format!(
         "{}/api/client-controller/job-result",
@@ -1489,6 +1526,8 @@ fn report_job_result_remote(
         "status": status,
         "result": result,
         "error_message": error_message,
+        "lease_token": lease_token,
+        "sequence": sequence,
     });
     let response = http_client()?
         .post(endpoint)
@@ -1497,9 +1536,17 @@ fn report_job_result_remote(
         .send()
         .map_err(|e| format!("job result request failed: {e}"))?;
     let status_code = response.status();
-    let response_body: Value = response
-        .json()
-        .map_err(|e| format!("job result response parse failed: {e}"))?;
+    let raw_body = response
+        .text()
+        .map_err(|e| format!("job result response read failed: {e}"))?;
+    let response_body: Value = serde_json::from_str(&raw_body).map_err(|e| {
+        format!(
+            "job result response parse failed: {} (HTTP {}, body: {})",
+            e,
+            status_code.as_u16(),
+            preview_body(&raw_body, 500)
+        )
+    })?;
 
     if !status_code.is_success()
         || !response_body
@@ -1514,24 +1561,21 @@ fn report_job_result_remote(
         ));
     }
 
-    Ok(())
+    Ok(response_body
+        .get("acknowledged_sequence")
+        .and_then(Value::as_i64)
+        .unwrap_or(sequence))
 }
 
 fn report_job_progress_remote(
     app: &tauri::AppHandle,
     job_uuid: &str,
-    status_path: &Path,
+    progress: &Value,
     screenshot_path: &Path,
     include_screenshot: bool,
-) -> Result<bool, String> {
-    let raw_status = match fs::read_to_string(status_path) {
-        Ok(raw_status) => raw_status,
-        Err(_) => return Ok(false),
-    };
-    let progress: Value = match serde_json::from_str::<Value>(&raw_status) {
-        Ok(progress) if progress.is_object() => progress,
-        _ => return Ok(false),
-    };
+    lease_token: &str,
+    sequence: i64,
+) -> Result<i64, String> {
     let cfg = load_or_create_config(app)?;
     let endpoint = format!(
         "{}/api/client-controller/job-progress",
@@ -1539,7 +1583,9 @@ fn report_job_progress_remote(
     );
     let mut form = reqwest::blocking::multipart::Form::new()
         .text("job_uuid", job_uuid.to_string())
-        .text("progress", progress.to_string());
+        .text("progress", progress.to_string())
+        .text("lease_token", lease_token.to_string())
+        .text("sequence", sequence.to_string());
 
     if include_screenshot && screenshot_path.is_file() {
         let screenshot = fs::read(screenshot_path)
@@ -1583,7 +1629,235 @@ fn report_job_progress_remote(
         ));
     }
 
+    Ok(response_body
+        .get("acknowledged_sequence")
+        .and_then(Value::as_i64)
+        .unwrap_or(sequence))
+}
+
+fn initialize_job_delivery(app: &tauri::AppHandle, job: &RemoteJob) -> Result<(), String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+    conn.execute(
+        "INSERT INTO job_delivery_state (job_uuid, lease_token, last_sequence, updated_at)
+         VALUES (?1, ?2, 0, ?3)
+         ON CONFLICT(job_uuid) DO UPDATE SET lease_token = excluded.lease_token, updated_at = excluded.updated_at",
+        params![job.job_uuid, job.lease_token, now_iso()],
+    )
+    .map_err(|e| format!("initialize job delivery state failed: {e}"))?;
+    Ok(())
+}
+
+fn next_job_sequence(app: &tauri::AppHandle, job_uuid: &str) -> Result<i64, String> {
+    init_db(app)?;
+    let mut conn = open_db(app)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("start delivery sequence transaction failed: {e}"))?;
+    let current = tx
+        .query_row(
+            "SELECT last_sequence FROM job_delivery_state WHERE job_uuid = ?1",
+            params![job_uuid],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let next = current + 1;
+    tx.execute(
+        "INSERT INTO job_delivery_state (job_uuid, lease_token, last_sequence, updated_at)
+         VALUES (?1, '', ?2, ?3)
+         ON CONFLICT(job_uuid) DO UPDATE SET last_sequence = excluded.last_sequence, updated_at = excluded.updated_at",
+        params![job_uuid, next, now_iso()],
+    )
+    .map_err(|e| format!("update delivery sequence failed: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("commit delivery sequence failed: {e}"))?;
+    Ok(next)
+}
+
+fn queue_job_progress_delivery(
+    app: &tauri::AppHandle,
+    job: &RemoteJob,
+    status_path: &Path,
+    screenshot_path: &Path,
+    include_screenshot: bool,
+) -> Result<bool, String> {
+    let raw_status = match fs::read_to_string(status_path) {
+        Ok(raw_status) => raw_status,
+        Err(_) => return Ok(false),
+    };
+    let progress: Value = match serde_json::from_str::<Value>(&raw_status) {
+        Ok(progress) if progress.is_object() => progress,
+        _ => return Ok(false),
+    };
+    let sequence = next_job_sequence(app, &job.job_uuid)?;
+    let mut screenshot_to_send = None;
+    let conn = open_db(app)?;
+
+    if include_screenshot && screenshot_path.is_file() {
+        let bytes = fs::read(screenshot_path)
+            .map_err(|e| format!("read workflow screenshot for queue failed: {e}"))?;
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let previous_hash = conn
+            .query_row(
+                "SELECT last_screenshot_hash FROM job_delivery_state WHERE job_uuid = ?1",
+                params![job.job_uuid],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+
+        if previous_hash.as_deref() != Some(hash.as_str()) {
+            screenshot_to_send = Some(screenshot_path.to_string_lossy().to_string());
+            conn.execute(
+                "UPDATE job_delivery_state SET last_screenshot_hash = ?1, updated_at = ?2 WHERE job_uuid = ?3",
+                params![hash, now_iso(), job.job_uuid],
+            )
+            .map_err(|e| format!("update screenshot delivery hash failed: {e}"))?;
+        }
+    }
+
+    conn.execute(
+        "DELETE FROM outbox_events WHERE status = 'pending' AND event_type = 'job_progress' AND job_uuid = ?1",
+        params![job.job_uuid],
+    )
+    .map_err(|e| format!("coalesce job progress failed: {e}"))?;
+    conn.execute(
+        "INSERT INTO outbox_events
+         (event_type, payload_json, status, retry_count, created_at, job_uuid, sequence, next_attempt_at, screenshot_path)
+         VALUES ('job_progress', ?1, 'pending', 0, ?2, ?3, ?4, ?2, ?5)",
+        params![
+            progress.to_string(),
+            now_iso(),
+            job.job_uuid,
+            sequence,
+            screenshot_to_send
+        ],
+    )
+    .map_err(|e| format!("queue job progress delivery failed: {e}"))?;
     Ok(true)
+}
+
+fn queue_job_result_delivery(
+    app: &tauri::AppHandle,
+    job: &RemoteJob,
+    status: &str,
+    result: Value,
+    error_message: Option<String>,
+) -> Result<(), String> {
+    let sequence = next_job_sequence(app, &job.job_uuid)?;
+    let payload = json!({
+        "status": status,
+        "result": if result.is_object() { result } else { json!({"value": result}) },
+        "error_message": error_message,
+    });
+    let conn = open_db(app)?;
+    conn.execute(
+        "INSERT INTO outbox_events
+         (event_type, payload_json, status, retry_count, created_at, job_uuid, sequence, next_attempt_at)
+         VALUES ('job_result', ?1, 'pending', 0, ?2, ?3, ?4, ?2)",
+        params![payload.to_string(), now_iso(), job.job_uuid, sequence],
+    )
+    .map_err(|e| format!("queue job result delivery failed: {e}"))?;
+    Ok(())
+}
+
+fn flush_job_delivery_outbox(app: &tauri::AppHandle, limit: i64) -> Result<usize, String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, event_type, payload_json, job_uuid, sequence, screenshot_path, retry_count
+             FROM outbox_events
+             WHERE status = 'pending'
+               AND event_type IN ('job_progress', 'job_result')
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
+             ORDER BY id ASC LIMIT ?2",
+        )
+        .map_err(|e| format!("prepare job delivery outbox failed: {e}"))?;
+    let rows = stmt
+        .query_map(params![now_iso(), limit.max(1)], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|e| format!("query job delivery outbox failed: {e}"))?;
+    let events = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read job delivery outbox failed: {e}"))?;
+    drop(stmt);
+    let mut sent = 0usize;
+
+    for (id, event_type, payload_json, job_uuid, sequence, screenshot_path, retry_count) in events {
+        let payload: Value = serde_json::from_str(&payload_json)
+            .map_err(|e| format!("parse queued {event_type} failed: {e}"))?;
+        let lease_token = conn
+            .query_row(
+                "SELECT lease_token FROM job_delivery_state WHERE job_uuid = ?1",
+                params![job_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        let delivery = if event_type == "job_progress" {
+            report_job_progress_remote(
+                app,
+                &job_uuid,
+                &payload,
+                Path::new(screenshot_path.as_deref().unwrap_or("")),
+                screenshot_path.is_some(),
+                &lease_token,
+                sequence,
+            )
+        } else {
+            report_job_result_remote(
+                app,
+                &job_uuid,
+                payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed"),
+                payload.get("result").cloned().unwrap_or_else(|| json!({})),
+                payload
+                    .get("error_message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                &lease_token,
+                sequence,
+            )
+        };
+
+        match delivery {
+            Ok(_) => {
+                conn.execute(
+                    "UPDATE outbox_events SET status = 'sent', sent_at = ?1, last_error = NULL WHERE id = ?2",
+                    params![now_iso(), id],
+                )
+                .map_err(|e| format!("acknowledge job delivery failed: {e}"))?;
+                sent += 1;
+            }
+            Err(error) => {
+                let next_retry_count = retry_count + 1;
+                let exponent = (next_retry_count.min(8)) as u32;
+                let delay_seconds = (1_i64 << exponent).min(300);
+                let next_attempt =
+                    (Utc::now() + ChronoDuration::seconds(delay_seconds)).to_rfc3339();
+                conn.execute(
+                    "UPDATE outbox_events
+                     SET retry_count = ?1, next_attempt_at = ?2, last_error = ?3
+                     WHERE id = ?4",
+                    params![next_retry_count, next_attempt, error, id],
+                )
+                .map_err(|e| format!("defer failed job delivery failed: {e}"))?;
+            }
+        }
+    }
+
+    Ok(sent)
 }
 
 fn start_local_job_execution(app: &tauri::AppHandle, job: &RemoteJob) -> Result<i64, String> {
@@ -1591,7 +1865,11 @@ fn start_local_job_execution(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     let conn = open_db(app)?;
     conn.execute(
         "INSERT INTO job_executions_local (job_id, job_type, status, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![job.job_uuid, job.job_type, "running", json!({"startedAt": now_iso()}).to_string(), now_iso()],
+        params![job.job_uuid, job.job_type, "running", json!({
+            "startedAt": now_iso(),
+            "payloadVersion": job.payload_version,
+            "leaseExpiresAt": job.lease_expires_at,
+        }).to_string(), now_iso()],
     )
     .map_err(|e| format!("store local job execution failed: {e}"))?;
 
@@ -1650,6 +1928,30 @@ fn local_processes_internal(
     Ok(processes)
 }
 
+fn interrupted_workflow_job_ids(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT current.job_id
+             FROM job_executions_local current
+             WHERE current.id = (
+                 SELECT MAX(latest.id) FROM job_executions_local latest
+                 WHERE latest.job_id = current.job_id
+             )
+               AND current.job_type IN ('workflow_task', 'workflow_run')
+               AND current.status = 'interrupted'
+               AND current.job_id IS NOT NULL
+             ORDER BY current.id ASC LIMIT 10",
+        )
+        .map_err(|e| format!("prepare interrupted workflow query failed: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("query interrupted workflows failed: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read interrupted workflows failed: {e}"))
+}
+
 fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value, String> {
     let runtime_root = resolve_workflow_runtime(app)
         .ok_or_else(|| "workflow runtime not found in application resources".to_string())?;
@@ -1674,6 +1976,7 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
 
     let status_path = run_dir.join("status.json");
     let result_path = run_dir.join("result.json");
+    let _ = fs::remove_file(&result_path);
     let config_path = run_dir.join("runtime.json");
     let preview_path = run_dir.join("live.png");
     let browser_profile_path = run_dir.join("browser-profile");
@@ -1771,31 +2074,29 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         {
             Some(status) => break status,
             None => {
-                let _ = report_job_progress_remote(
+                let _ = queue_job_progress_delivery(
                     app,
-                    &job.job_uuid,
+                    job,
                     &status_path,
                     &preview_path,
                     live_preview_enabled,
                 );
+                let _ = flush_job_delivery_outbox(app, 10);
                 std::thread::sleep(Duration::from_secs(progress_interval_seconds));
             }
         }
     };
 
-    if let Err(error) = report_job_progress_remote(
-        app,
-        &job.job_uuid,
-        &status_path,
-        &preview_path,
-        live_preview_enabled,
-    ) {
+    if let Err(error) =
+        queue_job_progress_delivery(app, job, &status_path, &preview_path, live_preview_enabled)
+    {
         let _ = queue_local_event(
             app,
             "job_progress_failed",
             json!({ "job_uuid": job.job_uuid, "error": error }),
         );
     }
+    let _ = flush_job_delivery_outbox(app, 10);
 
     let result = fs::read_to_string(&result_path)
         .ok()
@@ -1832,15 +2133,7 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
             }
         }
 
-        if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(result);
-        }
-
-        return Err(result
-            .get("statusMessage")
-            .and_then(Value::as_str)
-            .unwrap_or("workflow task failed")
-            .to_string());
+        return Ok(result);
     }
 
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -1849,6 +2142,510 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         output_status.code(),
         preview_body(&stderr, 2000)
     ))
+}
+
+fn merge_workflow_context(context: &mut Value, result: &Value) {
+    let Some(target) = context.as_object_mut() else {
+        return;
+    };
+
+    for key in [
+        "account",
+        "new_password",
+        "generated_password",
+        "generated-password",
+        "verification_code",
+        "verificationCode",
+        "workflow_return",
+        "workflowReturn",
+        "workflow_return_ok",
+        "workflow_variables",
+        "workflowVariables",
+        "browserWindows",
+        "browserWsEndpoint",
+        "webmailSessionFilePath",
+        "remoteWebmailSessionPayload",
+        "browserSessionFilePath",
+        "remoteBrowserSessionPayload",
+        "browserSessionDeleted",
+        "deletedBrowserSession",
+    ] {
+        if let Some(value) = result.get(key) {
+            if !value.is_null() {
+                target.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    if let Some(windows) = result.get("browserWindows") {
+        target.insert("browser_windows".to_string(), windows.clone());
+    }
+}
+
+fn workflow_step_route(step: &Value, result: &Value, outcome: &str) -> Value {
+    if result
+        .get("routeRequested")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let completed_key = result
+            .get("completedTaskKey")
+            .or_else(|| result.get("completed_task_key"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if let Some(task) = step
+            .get("runtime")
+            .and_then(|runtime| runtime.get("tasks"))
+            .and_then(Value::as_array)
+            .and_then(|tasks| {
+                tasks.iter().find(|task| {
+                    task.get("key").and_then(Value::as_str).unwrap_or("") == completed_key
+                })
+            })
+        {
+            let route = if outcome == "success" {
+                task.get("next")
+            } else {
+                task.get("on_error").or_else(|| {
+                    task.get("status_routes")
+                        .and_then(|routes| routes.get(outcome))
+                })
+            };
+            if let Some(route) = route.filter(|route| route.is_object()) {
+                return route.clone();
+            }
+        }
+    }
+
+    if let Some(routes) = step.get("routes") {
+        if let Some(route) = routes
+            .get(outcome)
+            .or_else(|| routes.get("default"))
+            .filter(|route| route.is_object())
+        {
+            return route.clone();
+        }
+    }
+
+    if outcome == "success" {
+        if let Some(next) = step.get("defaultNext").and_then(Value::as_str) {
+            if !next.is_empty() {
+                return json!({"type": "step", "action_key": next});
+            }
+        }
+        json!({"type": "end"})
+    } else {
+        json!({"type": "fail"})
+    }
+}
+
+fn route_type_and_target(route: &Value, current_action: &str) -> (String, String, String) {
+    let mut route_type = route
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let target = route
+        .get("action_key")
+        .or_else(|| route.get("step"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let card = route
+        .get("card_key")
+        .or_else(|| route.get("card"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if route_type.is_empty() {
+        route_type = if !card.is_empty() { "card" } else { "step" }.to_string();
+    }
+    if matches!(target.as_str(), "end" | "fail") {
+        route_type = target.clone();
+    }
+    let target = if route_type == "card" && target.is_empty() {
+        current_action.to_string()
+    } else {
+        target
+    };
+    (route_type, target, card)
+}
+
+fn write_full_workflow_snapshot(
+    app: &tauri::AppHandle,
+    job: &RemoteJob,
+    state: &str,
+    message: &str,
+    current_step: Option<&Value>,
+    step_results: &[Value],
+    context: &Value,
+) -> Result<(), String> {
+    let run_dir = ensure_runtime_dir(app)?
+        .join("workflow-jobs")
+        .join(&job.job_uuid);
+    fs::create_dir_all(&run_dir)
+        .map_err(|e| format!("create full workflow directory failed: {e}"))?;
+    let status_path = run_dir.join("status.json");
+    let preview_path = run_dir.join("live.png");
+    let snapshot = json!({
+        "runId": job.job_uuid,
+        "state": state,
+        "stage": "client-workflow-run",
+        "message": message,
+        "isRunning": state == "running",
+        "currentStepId": current_step.and_then(|step| step.get("workflowStepId")).cloned(),
+        "currentStepRunId": current_step.and_then(|step| step.get("workflowStepRunId")).cloned(),
+        "steps": step_results,
+        "workflow": context,
+        "browserWindows": context.get("browserWindows").cloned(),
+        "browserWsEndpoint": context.get("browserWsEndpoint").cloned(),
+        "livePreviewEnabled": true,
+        "livePreviewIntervalSeconds": 3,
+        "livePreviewPollIntervalSeconds": 3,
+        "at": now_iso(),
+    });
+    fs::write(
+        &status_path,
+        serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| format!("serialize full workflow status failed: {e}"))?,
+    )
+    .map_err(|e| format!("write full workflow status failed: {e}"))?;
+    let _ = queue_job_progress_delivery(app, job, &status_path, &preview_path, true);
+    let _ = flush_job_delivery_outbox(app, 10);
+    Ok(())
+}
+
+fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value, String> {
+    if job.payload_version < 2 {
+        return Err("workflow_run requires payload version 2 or newer".to_string());
+    }
+
+    let bundle = job
+        .payload
+        .get("workflow_bundle")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| "workflow_run payload.workflow_bundle is missing".to_string())?;
+    let steps = bundle
+        .get("steps")
+        .and_then(Value::as_array)
+        .cloned()
+        .filter(|steps| !steps.is_empty())
+        .ok_or_else(|| "workflow bundle contains no steps".to_string())?;
+    let max_transitions = bundle
+        .get("maxTransitions")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .max(1);
+    let run_dir = ensure_runtime_dir(app)?
+        .join("workflow-jobs")
+        .join(&job.job_uuid);
+    fs::create_dir_all(&run_dir)
+        .map_err(|e| format!("create workflow run directory failed: {e}"))?;
+    let checkpoint_path = run_dir.join("workflow-checkpoint.json");
+    let checkpoint = fs::read_to_string(&checkpoint_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let mut context = checkpoint
+        .as_ref()
+        .and_then(|value| value.get("context"))
+        .cloned()
+        .unwrap_or_else(|| bundle.get("context").cloned().unwrap_or_else(|| json!({})));
+    let mut step_results = checkpoint
+        .as_ref()
+        .and_then(|value| value.get("steps"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut current_action = checkpoint
+        .as_ref()
+        .and_then(|value| value.get("nextActionKey"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            bundle
+                .get("startActionKey")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let mut start_card = checkpoint
+        .as_ref()
+        .and_then(|value| value.get("nextTaskKey"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let mut transitions = checkpoint
+        .as_ref()
+        .and_then(|value| value.get("transitions"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    while !current_action.is_empty() && transitions < max_transitions {
+        transitions += 1;
+        let Some(step) = steps.iter().find(|step| {
+            step.get("actionKey").and_then(Value::as_str).unwrap_or("") == current_action
+        }) else {
+            return Ok(json!({
+                "ok": false,
+                "status": "failed",
+                "statusMessage": format!("Workflow route target was not found: {current_action}"),
+                "steps": step_results,
+                "workflow": context,
+            }));
+        };
+        let interrupted_step_status = fs::read_to_string(run_dir.join("status.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .filter(|status| {
+                status.get("workflowStepId").and_then(Value::as_i64)
+                    == step.get("workflowStepId").and_then(Value::as_i64)
+                    && status.get("state").and_then(Value::as_str) != Some("completed")
+            });
+        let mut resume_after_task_key = String::new();
+
+        if let Some(checkpoint_status) = interrupted_step_status.as_ref() {
+            if let Some(tasks) = checkpoint_status.get("tasks").and_then(Value::as_array) {
+                for task in tasks.iter().filter(|task| {
+                    matches!(
+                        task.get("status").and_then(Value::as_str),
+                        Some("success") | Some("completed")
+                    )
+                }) {
+                    merge_workflow_context(&mut context, task);
+                    if let Some(key) = task.get("key").and_then(Value::as_str) {
+                        resume_after_task_key = key.to_string();
+                    }
+                }
+            }
+        }
+
+        write_full_workflow_snapshot(
+            app,
+            job,
+            "running",
+            step.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Workflow-Schritt wird ausgefuehrt."),
+            Some(step),
+            &step_results,
+            &context,
+        )?;
+
+        let wait_seconds = step.get("waitSeconds").and_then(Value::as_u64).unwrap_or(0);
+        let mut step_result = if wait_seconds > 0
+            && step
+                .get("runtime")
+                .and_then(|runtime| runtime.get("tasks"))
+                .and_then(Value::as_array)
+                .is_some_and(|tasks| tasks.is_empty())
+        {
+            let mut remaining = wait_seconds;
+            while remaining > 0 {
+                let chunk = remaining.min(3);
+                std::thread::sleep(Duration::from_secs(chunk));
+                remaining -= chunk;
+                write_full_workflow_snapshot(
+                    app,
+                    job,
+                    "running",
+                    &format!("Warteschritt: {remaining} Sekunden verbleibend."),
+                    Some(step),
+                    &step_results,
+                    &context,
+                )?;
+            }
+            json!({"ok": true, "status": "success", "statusMessage": "Warteschritt abgeschlossen."})
+        } else {
+            let mut runtime = step.get("runtime").cloned().unwrap_or_else(|| json!({}));
+            if let Some(runtime_object) = runtime.as_object_mut() {
+                runtime_object.insert("workflow".to_string(), context.clone());
+                runtime_object.insert(
+                    "runId".to_string(),
+                    json!(format!("{}-{}", job.job_uuid, transitions)),
+                );
+
+                if !start_card.is_empty() {
+                    if let Some(tasks) = runtime_object
+                        .get_mut("tasks")
+                        .and_then(Value::as_array_mut)
+                    {
+                        if let Some(index) = tasks.iter().position(|task| {
+                            task.get("key").and_then(Value::as_str).unwrap_or("") == start_card
+                        }) {
+                            *tasks = tasks[index..].to_vec();
+                        }
+                    }
+                } else if !resume_after_task_key.is_empty() {
+                    if let Some(tasks) = runtime_object
+                        .get_mut("tasks")
+                        .and_then(Value::as_array_mut)
+                    {
+                        if let Some(index) = tasks.iter().position(|task| {
+                            task.get("key").and_then(Value::as_str).unwrap_or("")
+                                == resume_after_task_key
+                        }) {
+                            *tasks = tasks.get(index + 1..).unwrap_or(&[]).to_vec();
+                        }
+                    }
+                }
+            }
+            let mut step_job = job.clone();
+            step_job.job_type = "workflow_task".to_string();
+            step_job.payload = json!({"runtime": runtime});
+            match execute_workflow_task_job(app, &step_job) {
+                Ok(result) => result,
+                Err(error) => json!({"ok": false, "status": "failed", "statusMessage": error}),
+            }
+        };
+
+        if let Some(object) = step_result.as_object_mut() {
+            object.insert(
+                "workflowStepId".to_string(),
+                step.get("workflowStepId").cloned().unwrap_or(Value::Null),
+            );
+            object.insert(
+                "workflowStepRunId".to_string(),
+                step.get("workflowStepRunId")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            object.insert("actionKey".to_string(), json!(current_action));
+            object.insert(
+                "state".to_string(),
+                json!(
+                    if object.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                ),
+            );
+        }
+        merge_workflow_context(&mut context, &step_result);
+        step_results.push(step_result.clone());
+        let outcome = step_result
+            .get("routeOutcome")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                if step_result
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "success"
+                } else {
+                    "failed"
+                }
+            });
+        let route = workflow_step_route(step, &step_result, outcome);
+        let (route_type, target, card) = route_type_and_target(&route, &current_action);
+
+        if route_type == "end" {
+            current_action.clear();
+        } else if route_type == "fail" {
+            let failed = json!({
+                "ok": false,
+                "status": "failed",
+                "statusMessage": step_result.get("statusMessage").cloned().unwrap_or_else(|| json!("Workflow wurde ueber eine Fehlerroute beendet.")),
+                "steps": step_results,
+                "workflow": context,
+                "finishedAt": now_iso(),
+            });
+            fs::write(
+                &checkpoint_path,
+                serde_json::to_vec_pretty(&failed)
+                    .map_err(|e| format!("serialize failed workflow checkpoint failed: {e}"))?,
+            )
+            .map_err(|e| format!("write failed workflow checkpoint failed: {e}"))?;
+            return Ok(failed);
+        } else {
+            current_action = if target == "next" {
+                step.get("defaultNext")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                target
+            };
+        }
+        start_card = card;
+
+        let wait_after = step
+            .get("waitAfterSeconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if wait_after > 0 && !current_action.is_empty() {
+            std::thread::sleep(Duration::from_secs(wait_after));
+        }
+
+        let checkpoint = json!({
+            "nextActionKey": current_action,
+            "nextTaskKey": start_card,
+            "transitions": transitions,
+            "context": context,
+            "steps": step_results,
+            "updatedAt": now_iso(),
+        });
+        fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&checkpoint)
+                .map_err(|e| format!("serialize workflow checkpoint failed: {e}"))?,
+        )
+        .map_err(|e| format!("write workflow checkpoint failed: {e}"))?;
+        write_full_workflow_snapshot(
+            app,
+            job,
+            if current_action.is_empty() {
+                "completed"
+            } else {
+                "running"
+            },
+            "Workflow-Schritt wurde lokal abgeschlossen.",
+            Some(step),
+            &step_results,
+            &context,
+        )?;
+    }
+
+    if transitions >= max_transitions && !current_action.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "status": "failed",
+            "statusMessage": "Zu viele Workflow-Routenwechsel. Moegliche Schleife.",
+            "steps": step_results,
+            "workflow": context,
+        }));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "status": "success",
+        "statusMessage": "Workflow wurde vollstaendig auf dem ClientController ausgefuehrt.",
+        "steps": step_results,
+        "workflow": context,
+        "workflow_variables": context.get("workflow_variables").cloned(),
+        "workflowVariables": context.get("workflowVariables").cloned(),
+        "workflow_return": context.get("workflow_return").cloned(),
+        "workflowReturn": context.get("workflowReturn").cloned(),
+        "workflow_return_ok": context.get("workflow_return_ok").cloned(),
+        "account": context.get("account").cloned(),
+        "new_password": context.get("new_password").cloned(),
+        "generated_password": context.get("generated_password").cloned(),
+        "generated-password": context.get("generated-password").cloned(),
+        "verification_code": context.get("verification_code").cloned(),
+        "verificationCode": context.get("verificationCode").cloned(),
+        "browserWindows": context.get("browserWindows").cloned(),
+        "browserWsEndpoint": context.get("browserWsEndpoint").cloned(),
+        "webmailSessionFilePath": context.get("webmailSessionFilePath").cloned(),
+        "remoteWebmailSessionPayload": context.get("remoteWebmailSessionPayload").cloned(),
+        "browserSessionFilePath": context.get("browserSessionFilePath").cloned(),
+        "remoteBrowserSessionPayload": context.get("remoteBrowserSessionPayload").cloned(),
+        "browserSessionDeleted": context.get("browserSessionDeleted").cloned(),
+        "deletedBrowserSession": context.get("deletedBrowserSession").cloned(),
+        "finishedAt": now_iso(),
+    }))
 }
 
 fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Value, String> {
@@ -1997,8 +2794,36 @@ fn execute_node_update(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value,
     app.restart();
 }
 
+struct WorkflowJobGuard(bool);
+
+impl Drop for WorkflowJobGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            WORKFLOW_JOB_RUNNING.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
+    let is_workflow_job = matches!(job.job_type.as_str(), "workflow_task" | "workflow_run");
+    let acquired_workflow_slot = !is_workflow_job
+        || WORKFLOW_JOB_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+    let _workflow_guard = WorkflowJobGuard(is_workflow_job && acquired_workflow_slot);
     let execution_id = start_local_job_execution(&app, &job).ok();
+    let _ = initialize_job_delivery(&app, &job);
+
+    if !acquired_workflow_slot {
+        let error = "another workflow job is already running on this node".to_string();
+        let details = json!({ "ok": false, "status": "failed", "statusMessage": error });
+        if let Some(execution_id) = execution_id {
+            let _ = finish_local_job_execution(&app, execution_id, "failed", &details);
+        }
+        let _ = queue_job_result_delivery(&app, &job, "failed", details, Some(error));
+        let _ = flush_job_delivery_outbox(&app, 10);
+        return;
+    }
     let cfg = match load_or_create_config(&app) {
         Ok(cfg) => cfg,
         Err(error) => {
@@ -2016,6 +2841,7 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
 
     let execution = verify_job_signature(&cfg, &job).and_then(|_| match job.job_type.as_str() {
         "workflow_task" => execute_workflow_task_job(&app, &job),
+        "workflow_run" => execute_workflow_run_job(&app, &job),
         "ping" => Ok(json!({ "ok": true, "statusMessage": "ClientController node is reachable", "at": now_iso() })),
         "node_diagnostics" | "node_outbox_list" | "node_outbox_clear" | "node_discover_devices" | "node_sync" => {
             execute_node_control_job(&app, &job.job_type)
@@ -2026,11 +2852,21 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
 
     match execution {
         Ok(result) => {
+            let execution_ok = result.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            let remote_status = if execution_ok { "success" } else { "failed" };
+            let result_error = if execution_ok {
+                None
+            } else {
+                result
+                    .get("statusMessage")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
             if let Some(execution_id) = execution_id {
-                let _ = finish_local_job_execution(&app, execution_id, "success", &result);
+                let _ = finish_local_job_execution(&app, execution_id, remote_status, &result);
             }
             if let Err(error) =
-                report_job_result_remote(&app, &job.job_uuid, "success", result, None)
+                queue_job_result_delivery(&app, &job, remote_status, result, result_error)
             {
                 let _ = queue_local_event(
                     &app,
@@ -2038,6 +2874,7 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
                     json!({ "job_uuid": job.job_uuid, "error": error }),
                 );
             }
+            let _ = flush_job_delivery_outbox(&app, 10);
         }
         Err(error) => {
             let details =
@@ -2046,7 +2883,7 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
                 let _ = finish_local_job_execution(&app, execution_id, "failed", &details);
             }
             if let Err(report_error) =
-                report_job_result_remote(&app, &job.job_uuid, "failed", details, Some(error))
+                queue_job_result_delivery(&app, &job, "failed", details, Some(error))
             {
                 let _ = queue_local_event(
                     &app,
@@ -2054,20 +2891,30 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
                     json!({ "job_uuid": job.job_uuid, "error": report_error }),
                 );
             }
+            let _ = flush_job_delivery_outbox(&app, 10);
         }
     }
 }
 
 fn pull_and_start_jobs_remote_internal(app: &tauri::AppHandle) -> Result<usize, String> {
+    if WORKFLOW_JOB_RUNNING.load(Ordering::SeqCst) {
+        return Ok(0);
+    }
+
     let cfg = load_or_create_config(app)?;
     let endpoint = format!(
         "{}/api/client-controller/pull-jobs",
         base_url(&cfg.server_domain)
     );
+    let resume_job_uuids = interrupted_workflow_job_ids(app)?;
     let response = http_client()?
         .post(endpoint)
         .header("X-NODE-API-KEY", cfg.api_key.clone())
-        .json(&json!({ "api_key": cfg.api_key }))
+        .json(&json!({
+            "api_key": cfg.api_key,
+            "protocol_version": 2,
+            "resume_job_uuids": resume_job_uuids,
+        }))
         .send()
         .map_err(|e| format!("pull jobs request failed: {e}"))?;
     let status_code = response.status();
@@ -2105,6 +2952,14 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
     bootstrap_local_runtime(app.clone())?;
 
     let mut notes: Vec<String> = Vec::new();
+    match flush_job_delivery_outbox(app, 50) {
+        Ok(sent) if sent > 0 => notes.push(format!("deliveries:ok({sent})")),
+        Ok(_) => {}
+        Err(error) => notes.push(format!(
+            "deliveries:deferred({})",
+            preview_body(&error, 120)
+        )),
+    }
     let mut registered = false;
     let mut discovered_devices = 0usize;
     let mut synced_devices = 0usize;
@@ -2719,7 +3574,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::authentication_failed;
+    use super::{authentication_failed, route_type_and_target, workflow_step_route};
+    use serde_json::json;
 
     #[test]
     fn detects_node_authentication_failures() {
@@ -2730,5 +3586,39 @@ mod tests {
             "register failed: HTTP 403 - forbidden"
         ));
         assert!(!authentication_failed("request failed: connection refused"));
+    }
+
+    #[test]
+    fn resolves_task_and_linear_workflow_routes() {
+        let step = json!({
+            "actionKey": "first",
+            "defaultNext": "second",
+            "routes": {},
+            "runtime": {
+                "tasks": [{
+                    "key": "branch",
+                    "next": {"type": "card", "card_key": "continue"}
+                }]
+            }
+        });
+        let task_route = workflow_step_route(
+            &step,
+            &json!({"routeRequested": true, "completedTaskKey": "branch"}),
+            "success",
+        );
+        assert_eq!(
+            route_type_and_target(&task_route, "first"),
+            (
+                "card".to_string(),
+                "first".to_string(),
+                "continue".to_string()
+            )
+        );
+
+        let linear_route = workflow_step_route(&step, &json!({"ok": true}), "success");
+        assert_eq!(
+            route_type_and_target(&linear_route, "first"),
+            ("step".to_string(), "second".to_string(), "".to_string())
+        );
     }
 }
