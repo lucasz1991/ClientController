@@ -36,6 +36,8 @@ struct ClientConfig {
     bootstrap_api_key: String,
     environment: String,
     allow_server_rebind: bool,
+    adb_enabled: bool,
+    adb_device_discovery_enabled: bool,
     last_successful_server: String,
 }
 
@@ -49,6 +51,8 @@ impl Default for ClientConfig {
             bootstrap_api_key: DEFAULT_BOOTSTRAP_API_KEY.to_string(),
             environment: "production".to_string(),
             allow_server_rebind: true,
+            adb_enabled: true,
+            adb_device_discovery_enabled: true,
             last_successful_server: DEFAULT_SERVER_DOMAIN.to_string(),
         }
     }
@@ -77,6 +81,12 @@ struct RebindRequest {
     new_server_domain: String,
     expires_at: String,
     signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdbSettingsUpdate {
+    adb_enabled: bool,
+    adb_device_discovery_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -321,6 +331,18 @@ fn save_config(app: &tauri::AppHandle, cfg: &ClientConfig) -> Result<(), String>
     let content =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize config failed: {e}"))?;
     fs::write(path, content).map_err(|e| format!("save config failed: {e}"))
+}
+
+fn adb_enabled(app: &tauri::AppHandle) -> bool {
+    load_or_create_config(app)
+        .map(|cfg| cfg.adb_enabled)
+        .unwrap_or(true)
+}
+
+fn adb_device_discovery_enabled(app: &tauri::AppHandle) -> bool {
+    load_or_create_config(app)
+        .map(|cfg| cfg.adb_enabled && cfg.adb_device_discovery_enabled)
+        .unwrap_or(true)
 }
 
 fn open_db(app: &tauri::AppHandle) -> Result<Connection, String> {
@@ -616,6 +638,10 @@ fn candidate_adb_paths(app: &tauri::AppHandle) -> Vec<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn stop_bundled_adb_processes(app: &tauri::AppHandle) {
+    if !adb_enabled(app) {
+        return;
+    }
+
     let executable_paths = candidate_adb_paths(app)
         .into_iter()
         .filter(|path| path.is_file())
@@ -659,6 +685,10 @@ Get-CimInstance Win32_Process -Filter "Name = 'adb.exe'" | ForEach-Object {
 
 #[cfg(not(target_os = "windows"))]
 fn stop_bundled_adb_processes(app: &tauri::AppHandle) {
+    if !adb_enabled(app) {
+        return;
+    }
+
     if let Some(path) = candidate_adb_paths(app)
         .into_iter()
         .find(|path| path.is_file())
@@ -696,6 +726,10 @@ fn resolve_adb(app: &tauri::AppHandle) -> (Option<PathBuf>, String, Vec<String>)
 }
 
 fn detect_adb_source(app: &tauri::AppHandle) -> (String, bool) {
+    if !adb_enabled(app) {
+        return ("deaktiviert".to_string(), false);
+    }
+
     let (_path, source, _checked) = resolve_adb(app);
     let available = source != "not-found";
     (source, available)
@@ -930,6 +964,10 @@ fn try_install_windows_usb_driver_best_effort(app: &tauri::AppHandle) -> Result<
 }
 
 fn restart_adb_server(app: &tauri::AppHandle) {
+    if !adb_enabled(app) {
+        return;
+    }
+
     let (adb_path, source, _checked) = resolve_adb(app);
 
     if let Some(path) = adb_path {
@@ -942,6 +980,10 @@ fn restart_adb_server(app: &tauri::AppHandle) {
 }
 
 fn adb_devices_raw_output(app: &tauri::AppHandle) -> Result<(String, String), String> {
+    if !adb_enabled(app) {
+        return Err("ADB-Steuerung ist lokal deaktiviert.".to_string());
+    }
+
     let (adb_path, adb_source, checked) = resolve_adb(app);
 
     let output = if let Some(path) = adb_path {
@@ -985,6 +1027,14 @@ fn discover_android_devices_internal(
 ) -> Result<Vec<LocalDevice>, String> {
     init_db(app)?;
 
+    if !adb_enabled(app) {
+        return Err("ADB-Steuerung ist lokal deaktiviert.".to_string());
+    }
+
+    if !adb_device_discovery_enabled(app) {
+        return Err("ADB-Gerätesuche ist lokal deaktiviert.".to_string());
+    }
+
     let (stdout, _) = adb_devices_raw_output(app)?;
     let mut devices = parse_adb_devices_output(&stdout);
 
@@ -1021,6 +1071,8 @@ fn register_node_remote_internal(
     let workflow_ready = workflow_runtime_ready(app);
 
     let register_key = cfg.bootstrap_api_key.clone();
+    let adb_capable = cfg.adb_enabled;
+    let adb_device_discovery_capable = cfg.adb_enabled && cfg.adb_device_discovery_enabled;
 
     let payload = json!({
         "name": node_name.unwrap_or_else(|| format!("ClientNode-{}", &cfg.node_uuid)),
@@ -1031,7 +1083,9 @@ fn register_node_remote_internal(
         "last_successful_server_domain": cfg.last_successful_server,
         "bootstrap_api_key": register_key,
         "capabilities": {
-            "android": true,
+            "android": adb_capable,
+            "adb": adb_capable,
+            "adb_device_discovery": adb_device_discovery_capable,
             "remote_network": true,
             "screenshots": true,
             "browser": workflow_ready,
@@ -1196,6 +1250,8 @@ fn heartbeat_remote_internal(
         base_url(&cfg.server_domain)
     );
     let workflow_ready = workflow_runtime_ready(app);
+    let adb_capable = cfg.adb_enabled;
+    let adb_device_discovery_capable = cfg.adb_enabled && cfg.adb_device_discovery_enabled;
     let mut heartbeat_payload = payload.unwrap_or_else(|| json!({"source": "tauri-client"}));
 
     if let Some(object) = heartbeat_payload.as_object_mut() {
@@ -1226,7 +1282,9 @@ fn heartbeat_remote_internal(
         "last_successful_server_domain": cfg.last_successful_server,
         "api_key": cfg.api_key,
         "capabilities": {
-            "android": true,
+            "android": adb_capable,
+            "adb": adb_capable,
+            "adb_device_discovery": adb_device_discovery_capable,
             "remote_network": true,
             "screenshots": true,
             "browser": workflow_ready,
@@ -3480,6 +3538,8 @@ fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Va
                     "lastSuccessfulServer": status.config.last_successful_server,
                     "environment": status.config.environment,
                     "allowServerRebind": status.config.allow_server_rebind,
+                    "adbEnabled": status.config.adb_enabled,
+                    "adbDeviceDiscoveryEnabled": status.config.adb_device_discovery_enabled,
                     "pendingEvents": status.pending_events,
                     "localDevices": status.local_devices,
                     "adbSource": status.adb_source,
@@ -3513,6 +3573,17 @@ fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Va
             }))
         }
         "node_discover_devices" => {
+            if !adb_device_discovery_enabled(app) {
+                return Ok(json!({
+                    "ok": true,
+                    "statusMessage": "ADB-Geraetesuche ist lokal deaktiviert.",
+                    "count": 0,
+                    "devices": [],
+                    "skipped": true,
+                    "completedAt": now_iso(),
+                }));
+            }
+
             let devices = discover_android_devices_internal(app, true)?;
 
             Ok(json!({
@@ -3524,8 +3595,17 @@ fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Va
             }))
         }
         "node_sync" => {
-            let devices = discover_android_devices_internal(app, true)?;
-            let synced = sync_devices_remote_internal(app)?;
+            let discovery_enabled = adb_device_discovery_enabled(app);
+            let devices = if discovery_enabled {
+                discover_android_devices_internal(app, true)?
+            } else {
+                Vec::new()
+            };
+            let synced = if discovery_enabled {
+                sync_devices_remote_internal(app)?
+            } else {
+                0
+            };
             heartbeat_remote_internal(
                 app,
                 "online",
@@ -3538,9 +3618,10 @@ fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Va
 
             Ok(json!({
                 "ok": true,
-                "statusMessage": "Node-Synchronisierung abgeschlossen.",
+                "statusMessage": if discovery_enabled { "Node-Synchronisierung abgeschlossen." } else { "Node-Synchronisierung ohne ADB-Geraetesuche abgeschlossen." },
                 "discoveredDevices": devices.len(),
                 "syncedDevices": synced,
+                "adbDeviceDiscoveryEnabled": discovery_enabled,
                 "completedAt": now_iso(),
             }))
         }
@@ -3731,6 +3812,7 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
     let mut synced_devices = 0usize;
     let mut heartbeat_sent = false;
     let mut jobs_started = 0usize;
+    let discovery_enabled = adb_device_discovery_enabled(app);
 
     match load_or_create_config(app) {
         Ok(cfg) => {
@@ -3758,66 +3840,77 @@ fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, Strin
         }
     }
 
-    match discover_android_devices_internal(app, true) {
-        Ok(devices) => {
-            discovered_devices = devices.iter().filter(|d| d.status == "online").count();
-            notes.push(format!("discover:ok({})", discovered_devices));
-        }
-        Err(err) => {
-            let _ = queue_local_event(
-                app,
-                "discover_devices_failed",
-                json!({ "error": err.clone() }),
-            );
-            notes.push(format!("discover:fail({})", preview_body(&err, 120)));
-        }
-    }
-
-    match sync_devices_remote_internal(app) {
-        Ok(count) => {
-            synced_devices = count;
-            notes.push(format!("sync:ok({})", count));
-        }
-        Err(err) => match recover_node_registration(app, &err) {
-            Ok(true) => {
-                registered = true;
-                notes.push("register:recovered(unauthorized)".to_string());
-
-                match sync_devices_remote_internal(app) {
-                    Ok(count) => {
-                        synced_devices = count;
-                        notes.push(format!("sync:retry-ok({})", count));
-                    }
-                    Err(retry_err) => {
-                        let _ = queue_local_event(
-                            app,
-                            "sync_devices_failed",
-                            json!({ "error": retry_err.clone(), "after_reregister": true }),
-                        );
-                        notes.push(format!(
-                            "sync:retry-fail({})",
-                            preview_body(&retry_err, 120)
-                        ));
-                    }
-                }
+    if discovery_enabled {
+        match discover_android_devices_internal(app, true) {
+            Ok(devices) => {
+                discovered_devices = devices.iter().filter(|d| d.status == "online").count();
+                notes.push(format!("discover:ok({})", discovered_devices));
             }
-            Ok(false) => {
-                let _ =
-                    queue_local_event(app, "sync_devices_failed", json!({ "error": err.clone() }));
-                notes.push(format!("sync:fail({})", preview_body(&err, 120)));
-            }
-            Err(register_err) => {
+            Err(err) => {
                 let _ = queue_local_event(
                     app,
-                    "register_node_failed",
-                    json!({ "error": register_err.clone(), "trigger": err }),
+                    "discover_devices_failed",
+                    json!({ "error": err.clone() }),
                 );
-                notes.push(format!(
-                    "register:recovery-fail({})",
-                    preview_body(&register_err, 120)
-                ));
+                notes.push(format!("discover:fail({})", preview_body(&err, 120)));
             }
-        },
+        }
+    } else {
+        notes.push("discover:skip(disabled)".to_string());
+    }
+
+    if discovery_enabled {
+        match sync_devices_remote_internal(app) {
+            Ok(count) => {
+                synced_devices = count;
+                notes.push(format!("sync:ok({})", count));
+            }
+            Err(err) => match recover_node_registration(app, &err) {
+                Ok(true) => {
+                    registered = true;
+                    notes.push("register:recovered(unauthorized)".to_string());
+
+                    match sync_devices_remote_internal(app) {
+                        Ok(count) => {
+                            synced_devices = count;
+                            notes.push(format!("sync:retry-ok({})", count));
+                        }
+                        Err(retry_err) => {
+                            let _ = queue_local_event(
+                                app,
+                                "sync_devices_failed",
+                                json!({ "error": retry_err.clone(), "after_reregister": true }),
+                            );
+                            notes.push(format!(
+                                "sync:retry-fail({})",
+                                preview_body(&retry_err, 120)
+                            ));
+                        }
+                    }
+                }
+                Ok(false) => {
+                    let _ = queue_local_event(
+                        app,
+                        "sync_devices_failed",
+                        json!({ "error": err.clone() }),
+                    );
+                    notes.push(format!("sync:fail({})", preview_body(&err, 120)));
+                }
+                Err(register_err) => {
+                    let _ = queue_local_event(
+                        app,
+                        "register_node_failed",
+                        json!({ "error": register_err.clone(), "trigger": err }),
+                    );
+                    notes.push(format!(
+                        "register:recovery-fail({})",
+                        preview_body(&register_err, 120)
+                    ));
+                }
+            },
+        }
+    } else {
+        notes.push("sync:skip(disabled)".to_string());
     }
 
     match heartbeat_remote_internal(
@@ -4042,6 +4135,27 @@ fn update_server_domain(
     Ok(GenericResult {
         success: true,
         message: format!("server_domain updated to {normalized}"),
+    })
+}
+
+#[tauri::command]
+fn update_adb_settings(
+    app: tauri::AppHandle,
+    settings: AdbSettingsUpdate,
+) -> Result<GenericResult, String> {
+    let mut cfg = load_or_create_config(&app)?;
+    cfg.adb_enabled = settings.adb_enabled;
+    cfg.adb_device_discovery_enabled =
+        settings.adb_enabled && settings.adb_device_discovery_enabled;
+    save_config(&app, &cfg)?;
+
+    Ok(GenericResult {
+        success: true,
+        message: if cfg.adb_enabled {
+            "ADB-Einstellungen gespeichert.".to_string()
+        } else {
+            "ADB-Steuerung deaktiviert.".to_string()
+        },
     })
 }
 
@@ -4337,6 +4451,7 @@ pub fn run() {
             get_workflow_process_preview,
             export_workflow_process_debug,
             update_server_domain,
+            update_adb_settings,
             queue_event_local,
             get_pending_events,
             mark_event_sent,
