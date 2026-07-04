@@ -2584,13 +2584,12 @@ fn workflow_task_hard_timeout_seconds(runtime: &Value) -> u64 {
 
 fn workflow_task_release_on_result(runtime: &Value) -> bool {
     matches!(
-        runtime.get("keepWorkflowBrowserAlive"),
-        Some(Value::Bool(false))
+        runtime.get("clientControllerReleaseOnResult"),
+        Some(Value::Bool(true))
     ) || matches!(
-        runtime.get("keep_workflow_browser_alive"),
-        Some(Value::Bool(false))
-    ) || matches!(
-        runtime.get("workflowBundleStep").and_then(Value::as_bool),
+        runtime
+            .get("client_controller_release_on_result")
+            .and_then(Value::as_bool),
         Some(true)
     )
 }
@@ -3023,6 +3022,7 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         "workflowVariables",
         "browserWindows",
         "browserWsEndpoint",
+        "browserIdentity",
         "webmailSessionFilePath",
         "remoteWebmailSessionPayload",
         "browserSessionFilePath",
@@ -3262,6 +3262,7 @@ fn write_full_workflow_snapshot(
         "workflow": context,
         "browserWindows": context.get("browserWindows").cloned(),
         "browserWsEndpoint": context.get("browserWsEndpoint").cloned(),
+        "browserIdentity": context.get("browserIdentity").cloned(),
         "livePreviewEnabled": true,
         "livePreviewIntervalSeconds": 3,
         "livePreviewPollIntervalSeconds": 3,
@@ -3710,6 +3711,7 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         "verificationCode": context.get("verificationCode").cloned(),
         "browserWindows": context.get("browserWindows").cloned(),
         "browserWsEndpoint": context.get("browserWsEndpoint").cloned(),
+        "browserIdentity": context.get("browserIdentity").cloned(),
         "webmailSessionFilePath": context.get("webmailSessionFilePath").cloned(),
         "remoteWebmailSessionPayload": context.get("remoteWebmailSessionPayload").cloned(),
         "browserSessionFilePath": context.get("browserSessionFilePath").cloned(),
