@@ -2,13 +2,15 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flate2::read::GzDecoder;
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tar::Archive;
@@ -139,6 +141,23 @@ struct RemoteJob {
     lease_token: String,
     #[serde(default)]
     lease_expires_at: Option<String>,
+    #[serde(default)]
+    control: Option<RemoteControl>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RemoteControl {
+    command: String,
+    #[serde(default)]
+    sequence: i64,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Debug)]
+struct DeliveryAck {
+    acknowledged_sequence: i64,
+    control: Option<RemoteControl>,
 }
 
 fn default_payload_version() -> u64 {
@@ -314,6 +333,9 @@ fn init_db(app: &tauri::AppHandle) -> Result<(), String> {
             lease_token TEXT NOT NULL DEFAULT '',
             last_sequence INTEGER NOT NULL DEFAULT 0,
             last_screenshot_hash TEXT,
+            control_command TEXT,
+            control_sequence INTEGER NOT NULL DEFAULT 0,
+            control_payload_json TEXT,
             updated_at TEXT NOT NULL
         );
 
@@ -365,6 +387,17 @@ fn init_db(app: &tauri::AppHandle) -> Result<(), String> {
     ] {
         let _ = conn.execute(
             &format!("ALTER TABLE outbox_events ADD COLUMN {column}"),
+            [],
+        );
+    }
+
+    for column in [
+        "control_command TEXT",
+        "control_sequence INTEGER NOT NULL DEFAULT 0",
+        "control_payload_json TEXT",
+    ] {
+        let _ = conn.execute(
+            &format!("ALTER TABLE job_delivery_state ADD COLUMN {column}"),
             [],
         );
     }
@@ -1509,7 +1542,7 @@ fn report_job_result_remote(
     error_message: Option<String>,
     lease_token: &str,
     sequence: i64,
-) -> Result<i64, String> {
+) -> Result<DeliveryAck, String> {
     let cfg = load_or_create_config(app)?;
     let endpoint = format!(
         "{}/api/client-controller/job-result",
@@ -1561,10 +1594,7 @@ fn report_job_result_remote(
         ));
     }
 
-    Ok(response_body
-        .get("acknowledged_sequence")
-        .and_then(Value::as_i64)
-        .unwrap_or(sequence))
+    delivery_ack_from_response(&response_body, sequence)
 }
 
 fn report_job_progress_remote(
@@ -1575,7 +1605,7 @@ fn report_job_progress_remote(
     include_screenshot: bool,
     lease_token: &str,
     sequence: i64,
-) -> Result<i64, String> {
+) -> Result<DeliveryAck, String> {
     let cfg = load_or_create_config(app)?;
     let endpoint = format!(
         "{}/api/client-controller/job-progress",
@@ -1629,23 +1659,98 @@ fn report_job_progress_remote(
         ));
     }
 
-    Ok(response_body
-        .get("acknowledged_sequence")
-        .and_then(Value::as_i64)
-        .unwrap_or(sequence))
+    delivery_ack_from_response(&response_body, sequence)
+}
+
+fn delivery_ack_from_response(body: &Value, fallback_sequence: i64) -> Result<DeliveryAck, String> {
+    let control = body
+        .get("control")
+        .filter(|value| value.is_object())
+        .cloned()
+        .map(serde_json::from_value::<RemoteControl>)
+        .transpose()
+        .map_err(|e| format!("parse job control response failed: {e}"))?;
+
+    Ok(DeliveryAck {
+        acknowledged_sequence: body
+            .get("acknowledged_sequence")
+            .and_then(Value::as_i64)
+            .unwrap_or(fallback_sequence),
+        control,
+    })
 }
 
 fn initialize_job_delivery(app: &tauri::AppHandle, job: &RemoteJob) -> Result<(), String> {
     init_db(app)?;
     let conn = open_db(app)?;
     conn.execute(
-        "INSERT INTO job_delivery_state (job_uuid, lease_token, last_sequence, updated_at)
-         VALUES (?1, ?2, 0, ?3)
-         ON CONFLICT(job_uuid) DO UPDATE SET lease_token = excluded.lease_token, updated_at = excluded.updated_at",
-        params![job.job_uuid, job.lease_token, now_iso()],
+        "INSERT INTO job_delivery_state
+         (job_uuid, lease_token, last_sequence, control_command, control_sequence, control_payload_json, updated_at)
+         VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)
+         ON CONFLICT(job_uuid) DO UPDATE SET
+            lease_token = excluded.lease_token,
+            control_command = COALESCE(excluded.control_command, job_delivery_state.control_command),
+            control_sequence = MAX(excluded.control_sequence, job_delivery_state.control_sequence),
+            control_payload_json = COALESCE(excluded.control_payload_json, job_delivery_state.control_payload_json),
+            updated_at = excluded.updated_at",
+        params![
+            job.job_uuid,
+            job.lease_token,
+            job.control.as_ref().map(|control| control.command.as_str()),
+            job.control.as_ref().map(|control| control.sequence).unwrap_or(0),
+            job.control.as_ref().map(|control| control.payload.to_string()),
+            now_iso()
+        ],
     )
     .map_err(|e| format!("initialize job delivery state failed: {e}"))?;
     Ok(())
+}
+
+fn store_delivery_ack(conn: &Connection, job_uuid: &str, ack: &DeliveryAck) -> Result<(), String> {
+    if let Some(control) = ack.control.as_ref() {
+        conn.execute(
+            "UPDATE job_delivery_state
+             SET control_command = ?1, control_sequence = ?2, control_payload_json = ?3, updated_at = ?4
+             WHERE job_uuid = ?5 AND control_sequence <= ?2",
+            params![
+                control.command,
+                control.sequence,
+                control.payload.to_string(),
+                now_iso(),
+                job_uuid
+            ],
+        )
+        .map_err(|e| format!("store job control failed: {e}"))?;
+    }
+
+    let _ = ack.acknowledged_sequence;
+    Ok(())
+}
+
+fn pending_job_control(
+    app: &tauri::AppHandle,
+    job_uuid: &str,
+) -> Result<Option<RemoteControl>, String> {
+    init_db(app)?;
+    let conn = open_db(app)?;
+    conn.query_row(
+        "SELECT control_command, control_sequence, COALESCE(control_payload_json, '{}')
+         FROM job_delivery_state
+         WHERE job_uuid = ?1 AND control_command IS NOT NULL",
+        params![job_uuid],
+        |row| {
+            let command: String = row.get(0)?;
+            let sequence: i64 = row.get(1)?;
+            let payload_raw: String = row.get(2)?;
+            Ok(RemoteControl {
+                command,
+                sequence,
+                payload: serde_json::from_str(&payload_raw).unwrap_or_else(|_| json!({})),
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| format!("read pending job control failed: {e}"))
 }
 
 fn next_job_sequence(app: &tauri::AppHandle, job_uuid: &str) -> Result<i64, String> {
@@ -1832,7 +1937,8 @@ fn flush_job_delivery_outbox(app: &tauri::AppHandle, limit: i64) -> Result<usize
         };
 
         match delivery {
-            Ok(_) => {
+            Ok(ack) => {
+                store_delivery_ack(&conn, &job_uuid, &ack)?;
                 conn.execute(
                     "UPDATE outbox_events SET status = 'sent', sent_at = ?1, last_error = NULL WHERE id = ?2",
                     params![now_iso(), id],
@@ -1952,6 +2058,74 @@ fn interrupted_workflow_job_ids(app: &tauri::AppHandle) -> Result<Vec<String>, S
         .map_err(|e| format!("read interrupted workflows failed: {e}"))
 }
 
+fn acknowledge_pending_job_stop(
+    app: &tauri::AppHandle,
+    job: &RemoteJob,
+    status_path: &Path,
+    screenshot_path: &Path,
+) -> Result<Option<Value>, String> {
+    let Some(control) = pending_job_control(app, &job.job_uuid)? else {
+        return Ok(None);
+    };
+
+    if control.command != "stop" {
+        return Ok(None);
+    }
+
+    let result_status = control
+        .payload
+        .get("result_status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "cancelled" | "timed_out"))
+        .unwrap_or("cancelled");
+    let reason = control
+        .payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("Workflow wurde von der AI User Factory gestoppt.");
+    let stopping = json!({
+        "state": "stopping",
+        "status": result_status,
+        "isRunning": true,
+        "message": reason,
+        "statusMessage": reason,
+        "controlAcknowledged": "stop",
+        "controlSequence": control.sequence,
+        "at": now_iso(),
+    });
+    fs::write(
+        status_path,
+        serde_json::to_vec_pretty(&stopping)
+            .map_err(|e| format!("serialize stop acknowledgement failed: {e}"))?,
+    )
+    .map_err(|e| format!("write stop acknowledgement failed: {e}"))?;
+    let _ = queue_job_progress_delivery(app, job, status_path, screenshot_path, false);
+    let _ = flush_job_delivery_outbox(app, 10);
+
+    Ok(Some(json!({
+        "ok": false,
+        "status": result_status,
+        "state": result_status,
+        "statusMessage": reason,
+        "controlAcknowledged": "stop",
+        "controlSequence": control.sequence,
+        "finishedAt": now_iso(),
+    })))
+}
+
+fn terminate_child_tree(child: &mut Child) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(0x08000000)
+            .status();
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value, String> {
     let runtime_root = resolve_workflow_runtime(app)
         .ok_or_else(|| "workflow runtime not found in application resources".to_string())?;
@@ -2034,6 +2208,10 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     )
     .map_err(|e| format!("write initial workflow status failed: {e}"))?;
 
+    if let Some(stopped) = acknowledge_pending_job_stop(app, job, &status_path, &preview_path)? {
+        return Ok(stopped);
+    }
+
     let script = execution_runtime_root
         .join("node")
         .join("workflows")
@@ -2082,6 +2260,12 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
                     live_preview_enabled,
                 );
                 let _ = flush_job_delivery_outbox(app, 10);
+                if let Some(stopped) =
+                    acknowledge_pending_job_stop(app, job, &status_path, &preview_path)?
+                {
+                    terminate_child_tree(&mut child);
+                    return Ok(stopped);
+                }
                 std::thread::sleep(Duration::from_secs(progress_interval_seconds));
             }
         }
@@ -2344,6 +2528,8 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
     fs::create_dir_all(&run_dir)
         .map_err(|e| format!("create workflow run directory failed: {e}"))?;
     let checkpoint_path = run_dir.join("workflow-checkpoint.json");
+    let workflow_status_path = run_dir.join("status.json");
+    let workflow_preview_path = run_dir.join("live.png");
     let checkpoint = fs::read_to_string(&checkpoint_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
@@ -2432,6 +2618,15 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
             &step_results,
             &context,
         )?;
+        if let Some(mut stopped) =
+            acknowledge_pending_job_stop(app, job, &workflow_status_path, &workflow_preview_path)?
+        {
+            if let Some(object) = stopped.as_object_mut() {
+                object.insert("steps".to_string(), json!(step_results));
+                object.insert("workflow".to_string(), context.clone());
+            }
+            return Ok(stopped);
+        }
 
         let wait_seconds = step.get("waitSeconds").and_then(Value::as_u64).unwrap_or(0);
         let mut step_result = if wait_seconds > 0
@@ -2455,6 +2650,18 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                     &step_results,
                     &context,
                 )?;
+                if let Some(mut stopped) = acknowledge_pending_job_stop(
+                    app,
+                    job,
+                    &workflow_status_path,
+                    &workflow_preview_path,
+                )? {
+                    if let Some(object) = stopped.as_object_mut() {
+                        object.insert("steps".to_string(), json!(step_results));
+                        object.insert("workflow".to_string(), context.clone());
+                    }
+                    return Ok(stopped);
+                }
             }
             json!({"ok": true, "status": "success", "statusMessage": "Warteschritt abgeschlossen."})
         } else {
@@ -2523,6 +2730,17 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                 ),
             );
         }
+        if matches!(
+            step_result.get("status").and_then(Value::as_str),
+            Some("cancelled") | Some("timed_out")
+        ) {
+            step_results.push(step_result.clone());
+            if let Some(object) = step_result.as_object_mut() {
+                object.insert("steps".to_string(), json!(step_results));
+                object.insert("workflow".to_string(), context.clone());
+            }
+            return Ok(step_result);
+        }
         merge_workflow_context(&mut context, &step_result);
         step_results.push(step_result.clone());
         let outcome = step_result
@@ -2577,7 +2795,33 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
             .and_then(Value::as_u64)
             .unwrap_or(0);
         if wait_after > 0 && !current_action.is_empty() {
-            std::thread::sleep(Duration::from_secs(wait_after));
+            let mut remaining = wait_after;
+            while remaining > 0 {
+                let chunk = remaining.min(3);
+                std::thread::sleep(Duration::from_secs(chunk));
+                remaining -= chunk;
+                write_full_workflow_snapshot(
+                    app,
+                    job,
+                    "running",
+                    &format!("Wartezeit zwischen Schritten: {remaining} Sekunden verbleibend."),
+                    Some(step),
+                    &step_results,
+                    &context,
+                )?;
+                if let Some(mut stopped) = acknowledge_pending_job_stop(
+                    app,
+                    job,
+                    &workflow_status_path,
+                    &workflow_preview_path,
+                )? {
+                    if let Some(object) = stopped.as_object_mut() {
+                        object.insert("steps".to_string(), json!(step_results));
+                        object.insert("workflow".to_string(), context.clone());
+                    }
+                    return Ok(stopped);
+                }
+            }
         }
 
         let checkpoint = json!({
@@ -2853,7 +3097,14 @@ fn execute_remote_job(app: tauri::AppHandle, job: RemoteJob) {
     match execution {
         Ok(result) => {
             let execution_ok = result.get("ok").and_then(Value::as_bool).unwrap_or(true);
-            let remote_status = if execution_ok { "success" } else { "failed" };
+            let declared_status = result.get("status").and_then(Value::as_str).unwrap_or("");
+            let remote_status = match declared_status {
+                "cancelled" | "canceled" => "cancelled",
+                "timed_out" | "timeout" => "timed_out",
+                "failed" | "error" => "failed",
+                _ if execution_ok => "success",
+                _ => "failed",
+            };
             let result_error = if execution_ok {
                 None
             } else {
@@ -3574,7 +3825,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{authentication_failed, route_type_and_target, workflow_step_route};
+    use super::{
+        authentication_failed, delivery_ack_from_response, route_type_and_target,
+        workflow_step_route,
+    };
     use serde_json::json;
 
     #[test]
@@ -3586,6 +3840,28 @@ mod tests {
             "register failed: HTTP 403 - forbidden"
         ));
         assert!(!authentication_failed("request failed: connection refused"));
+    }
+
+    #[test]
+    fn parses_stop_control_from_progress_acknowledgement() {
+        let ack = delivery_ack_from_response(
+            &json!({
+                "acknowledged_sequence": 7,
+                "control": {
+                    "command": "stop",
+                    "sequence": 2,
+                    "payload": {"result_status": "timed_out"}
+                }
+            }),
+            1,
+        )
+        .expect("control response should parse");
+
+        assert_eq!(ack.acknowledged_sequence, 7);
+        let control = ack.control.expect("stop control should exist");
+        assert_eq!(control.command, "stop");
+        assert_eq!(control.sequence, 2);
+        assert_eq!(control.payload["result_status"], "timed_out");
     }
 
     #[test]
