@@ -2594,6 +2594,47 @@ fn workflow_task_release_on_result(runtime: &Value) -> bool {
     )
 }
 
+fn workflow_task_keeps_browser_alive(runtime: &Value) -> bool {
+    match runtime
+        .get("keepWorkflowBrowserAlive")
+        .or_else(|| runtime.get("keep_workflow_browser_alive"))
+    {
+        Some(Value::Bool(false)) => false,
+        Some(Value::Number(number)) if number.as_u64() == Some(0) => false,
+        Some(Value::String(value)) if matches!(value.as_str(), "false" | "0") => false,
+        _ => true,
+    }
+}
+
+fn configure_workflow_bundle_step_runtime(runtime: &mut serde_json::Map<String, Value>) {
+    runtime.insert("workflowBundleStep".to_string(), json!(true));
+    runtime.insert("keepWorkflowBrowserAlive".to_string(), json!(true));
+    runtime.insert("clientControllerReleaseOnResult".to_string(), json!(true));
+}
+
+fn workflow_result_owns_browser(runtime: &Value, result: &Value) -> bool {
+    if !workflow_task_keeps_browser_alive(runtime) {
+        return false;
+    }
+
+    let ws_endpoint = result
+        .get("browserWsEndpoint")
+        .or_else(|| result.pointer("/browserIdentity/wsEndpoint"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let has_windows = result
+        .get("browserWindows")
+        .and_then(Value::as_array)
+        .is_some_and(|windows| !windows.is_empty());
+    let connected_to_existing = result
+        .pointer("/browserIdentity/connectedToExistingBrowser")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    !ws_endpoint.is_empty() && has_windows && !connected_to_existing
+}
+
 fn chromium_no_sandbox_enabled(runtime: &Value) -> bool {
     [
         "chromiumNoSandbox",
@@ -2831,6 +2872,99 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
 
                 if release_on_finished_result {
                     if let Some(mut result) = workflow_task_finished_result(&result_path) {
+                        if workflow_result_owns_browser(&runtime, &result) {
+                            if let Some(object) = result.as_object_mut() {
+                                object.insert(
+                                    "clientControllerRunnerReleased".to_string(),
+                                    json!(true),
+                                );
+                                object.insert(
+                                    "clientControllerRunnerContinuesInBackground".to_string(),
+                                    json!(true),
+                                );
+                                object.insert(
+                                    "clientControllerRunnerReleaseReason".to_string(),
+                                    json!("workflow-browser-owner-background"),
+                                );
+                                object.insert(
+                                    "clientControllerRunnerProcessId".to_string(),
+                                    json!(child_pid),
+                                );
+                                object
+                                    .insert("browserOwnerProcessId".to_string(), json!(child_pid));
+                                object.insert(
+                                    "browserOwnerRunId".to_string(),
+                                    runtime.get("runId").cloned().unwrap_or(Value::Null),
+                                );
+
+                                let identity = object
+                                    .entry("browserIdentity".to_string())
+                                    .or_insert_with(|| json!({}));
+                                if let Some(identity) = identity.as_object_mut() {
+                                    identity.insert(
+                                        "ownerRunnerProcessId".to_string(),
+                                        json!(child_pid),
+                                    );
+                                    identity.insert(
+                                        "owner_runner_process_id".to_string(),
+                                        json!(child_pid),
+                                    );
+                                    identity.insert(
+                                        "ownerRunId".to_string(),
+                                        runtime.get("runId").cloned().unwrap_or(Value::Null),
+                                    );
+                                    identity
+                                        .insert("ownerJobUuid".to_string(), json!(job.job_uuid));
+                                }
+                            }
+
+                            write_workflow_runner_diagnostics(
+                                &run_dir,
+                                json!({
+                                    "stage": "workflow-browser-owner-background",
+                                    "message": "Der Listen-Runner bleibt als Browser-Eigentuemer im Hintergrund aktiv; der komplette Workflow wird ohne Prozessabbruch fortgesetzt.",
+                                    "jobUuid": job.job_uuid,
+                                    "runId": runtime.get("runId").cloned(),
+                                    "childProcessId": child_pid,
+                                    "elapsedSeconds": child_started_at.elapsed().as_secs(),
+                                    "releaseOnFinishedResult": release_on_finished_result,
+                                    "hardTimeoutSeconds": hard_timeout_seconds,
+                                    "runtimeManifest": runtime_manifest.clone(),
+                                    "status": read_json_file(&status_path),
+                                    "result": result.clone(),
+                                }),
+                            );
+                            let _ = queue_local_event(
+                                app,
+                                "workflow_browser_owner_background",
+                                json!({
+                                    "job_uuid": job.job_uuid,
+                                    "run_id": runtime.get("runId").cloned(),
+                                    "pid": child_pid,
+                                    "elapsed_seconds": child_started_at.elapsed().as_secs(),
+                                }),
+                            );
+                            let _ = queue_job_progress_delivery(
+                                app,
+                                job,
+                                &status_path,
+                                &preview_path,
+                                live_preview_enabled,
+                            );
+                            let _ = flush_job_delivery_outbox(app, 10);
+
+                            // A reaper thread retains the process handle without blocking the
+                            // workflow. The Node process owns CloakBrowser until browser.close,
+                            // workflow completion, or cancellation closes it.
+                            let _ = std::thread::Builder::new()
+                                .name(format!("workflow-browser-owner-{child_pid}"))
+                                .spawn(move || {
+                                    let _ = child.wait();
+                                });
+
+                            return Ok(enrich_workflow_task_result(result));
+                        }
+
                         let result_seen_at =
                             finished_result_seen_at.get_or_insert_with(Instant::now);
 
@@ -3003,6 +3137,9 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
             "browser_ws_endpoint",
             "browserWindows",
             "browser_windows",
+            "browserIdentity",
+            "browserOwnerProcessId",
+            "browserOwnerRunId",
         ] {
             target.remove(key);
         }
@@ -3022,7 +3159,8 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         "workflowVariables",
         "browserWindows",
         "browserWsEndpoint",
-        "browserIdentity",
+        "browserOwnerProcessId",
+        "browserOwnerRunId",
         "webmailSessionFilePath",
         "remoteWebmailSessionPayload",
         "browserSessionFilePath",
@@ -3044,6 +3182,22 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
     if !closed_browser {
         if let Some(windows) = result.get("browserWindows") {
             target.insert("browser_windows".to_string(), windows.clone());
+        }
+
+        if let Some(next_identity) = result.get("browserIdentity").and_then(Value::as_object) {
+            let mut identity = target
+                .get("browserIdentity")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+
+            for (key, value) in next_identity {
+                if !value.is_null() && value.as_str() != Some("") {
+                    identity.insert(key.clone(), value.clone());
+                }
+            }
+
+            target.insert("browserIdentity".to_string(), Value::Object(identity));
         }
     }
 }
@@ -3107,6 +3261,7 @@ fn close_workflow_browser_for_run(
     );
     runtime_object.insert("workflowBundleStep".to_string(), json!(true));
     runtime_object.insert("keepWorkflowBrowserAlive".to_string(), json!(false));
+    runtime_object.insert("clientControllerReleaseOnResult".to_string(), json!(false));
     runtime_object.insert("closeWorkflowBrowserAtEnd".to_string(), json!(true));
     runtime_object.insert(
         "tasks".to_string(),
@@ -3263,6 +3418,8 @@ fn write_full_workflow_snapshot(
         "browserWindows": context.get("browserWindows").cloned(),
         "browserWsEndpoint": context.get("browserWsEndpoint").cloned(),
         "browserIdentity": context.get("browserIdentity").cloned(),
+        "browserOwnerProcessId": context.get("browserOwnerProcessId").cloned(),
+        "browserOwnerRunId": context.get("browserOwnerRunId").cloned(),
         "livePreviewEnabled": true,
         "livePreviewIntervalSeconds": 3,
         "livePreviewPollIntervalSeconds": 3,
@@ -3476,8 +3633,7 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                     "runId".to_string(),
                     json!(format!("{}-{}", job.job_uuid, transitions)),
                 );
-                runtime_object.insert("workflowBundleStep".to_string(), json!(true));
-                runtime_object.insert("keepWorkflowBrowserAlive".to_string(), json!(false));
+                configure_workflow_bundle_step_runtime(runtime_object);
 
                 if !start_card.is_empty() {
                     if let Some(tasks) = runtime_object
@@ -3712,6 +3868,8 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         "browserWindows": context.get("browserWindows").cloned(),
         "browserWsEndpoint": context.get("browserWsEndpoint").cloned(),
         "browserIdentity": context.get("browserIdentity").cloned(),
+        "browserOwnerProcessId": context.get("browserOwnerProcessId").cloned(),
+        "browserOwnerRunId": context.get("browserOwnerRunId").cloned(),
         "webmailSessionFilePath": context.get("webmailSessionFilePath").cloned(),
         "remoteWebmailSessionPayload": context.get("remoteWebmailSessionPayload").cloned(),
         "browserSessionFilePath": context.get("browserSessionFilePath").cloned(),
@@ -4696,8 +4854,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        authentication_failed, chromium_no_sandbox_enabled, delivery_ack_from_response,
-        merge_workflow_context, route_type_and_target, workflow_step_route,
+        authentication_failed, chromium_no_sandbox_enabled, configure_workflow_bundle_step_runtime,
+        delivery_ack_from_response, merge_workflow_context, route_type_and_target,
+        workflow_result_owns_browser, workflow_step_route, workflow_task_release_on_result,
     };
     use serde_json::json;
 
@@ -4746,12 +4905,74 @@ mod tests {
     }
 
     #[test]
+    fn workflow_bundle_releases_the_list_but_keeps_the_browser_owner_alive() {
+        let mut runtime = json!({});
+        configure_workflow_bundle_step_runtime(
+            runtime
+                .as_object_mut()
+                .expect("workflow runtime should be an object"),
+        );
+
+        assert_eq!(runtime["workflowBundleStep"], true);
+        assert_eq!(runtime["keepWorkflowBrowserAlive"], true);
+        assert!(workflow_task_release_on_result(&runtime));
+        assert!(workflow_result_owns_browser(
+            &runtime,
+            &json!({
+                "browserWsEndpoint": "ws://127.0.0.1/devtools/browser/test",
+                "browserWindows": [{"key": "main", "targetId": "target-1"}],
+                "browserIdentity": {"connectedToExistingBrowser": false}
+            })
+        ));
+        assert!(!workflow_result_owns_browser(
+            &runtime,
+            &json!({
+                "browserWsEndpoint": "ws://127.0.0.1/devtools/browser/test",
+                "browserWindows": [{"key": "main", "targetId": "target-1"}],
+                "browserIdentity": {"connectedToExistingBrowser": true}
+            })
+        ));
+    }
+
+    #[test]
+    fn connected_list_preserves_the_original_browser_owner_identity() {
+        let mut context = json!({
+            "browserIdentity": {
+                "processId": 4100,
+                "ownerRunnerProcessId": 4200,
+                "ownerRunId": "workflow-1-1"
+            },
+            "browserOwnerProcessId": 4200,
+            "browserOwnerRunId": "workflow-1-1"
+        });
+
+        merge_workflow_context(
+            &mut context,
+            &json!({
+                "browserIdentity": {
+                    "processId": null,
+                    "runnerProcessId": 4300,
+                    "connectedToExistingBrowser": true
+                }
+            }),
+        );
+
+        assert_eq!(context["browserIdentity"]["processId"], 4100);
+        assert_eq!(context["browserIdentity"]["ownerRunnerProcessId"], 4200);
+        assert_eq!(context["browserIdentity"]["runnerProcessId"], 4300);
+        assert_eq!(context["browserOwnerProcessId"], 4200);
+    }
+
+    #[test]
     fn closed_browser_is_removed_from_workflow_context() {
         let mut context = json!({
             "browserWsEndpoint": "ws://127.0.0.1/devtools/browser/test",
             "browser_ws_endpoint": "ws://127.0.0.1/devtools/browser/test",
             "browserWindows": [{"key": "main", "targetId": "target-1"}],
             "browser_windows": [{"key": "main", "targetId": "target-1"}],
+            "browserIdentity": {"ownerRunnerProcessId": 4200},
+            "browserOwnerProcessId": 4200,
+            "browserOwnerRunId": "workflow-1-1",
             "workflow_variables": {"kept": true}
         });
 
@@ -4768,6 +4989,9 @@ mod tests {
         assert!(context.get("browser_ws_endpoint").is_none());
         assert!(context.get("browserWindows").is_none());
         assert!(context.get("browser_windows").is_none());
+        assert!(context.get("browserIdentity").is_none());
+        assert!(context.get("browserOwnerProcessId").is_none());
+        assert!(context.get("browserOwnerRunId").is_none());
         assert_eq!(context["workflow_variables"]["kept"], true);
     }
 
