@@ -61,10 +61,35 @@ type WorkflowProcessPreview = {
   status: Record<string, unknown>;
   result: Record<string, unknown>;
   checkpoint: Record<string, unknown>;
+  workflow_steps: Array<Record<string, unknown>>;
   screenshot_data_url?: string | null;
   stdout_tail: string;
   stderr_tail: string;
   run_directory: string;
+};
+
+type WorkflowRoutePreview = {
+  outcome: string;
+  target: string;
+  label: string;
+};
+
+type WorkflowTaskPreview = {
+  key: string;
+  title: string;
+  status: string;
+};
+
+type WorkflowTimelineItem = {
+  key: string;
+  index: number;
+  name: string;
+  actionKey: string;
+  type: string;
+  status: string;
+  message: string;
+  tasks: WorkflowTaskPreview[];
+  routes: WorkflowRoutePreview[];
 };
 
 type SyncSummary = {
@@ -104,6 +129,62 @@ let refreshTimer: number | null = null;
 const isBusy = computed(() => busy.value !== null);
 const online = computed(() => Boolean(status.value?.config.api_key));
 const runtimeReady = computed(() => Boolean(status.value?.node_available && status.value?.workflow_runtime_available));
+const workflowStepTimeline = computed<WorkflowTimelineItem[]>(() => {
+  const preview = workflowPreview.value;
+  if (!preview) return [];
+
+  const definitions = asRecordArray(preview.workflow_steps).length
+    ? asRecordArray(preview.workflow_steps)
+    : asRecordArray(preview.status.workflowSteps);
+  const snapshots = [
+    ...asRecordArray(preview.checkpoint.steps),
+    ...asRecordArray(preview.status.steps),
+    ...asRecordArray(preview.result.steps),
+  ];
+  const snapshotsByStep = new Map<string, Record<string, unknown>>();
+  const snapshotsByAction = new Map<string, Record<string, unknown>>();
+
+  for (const snapshot of snapshots) {
+    const stepId = workflowStepId(snapshot);
+    const actionKey = workflowActionKey(snapshot);
+    if (stepId) snapshotsByStep.set(stepId, snapshot);
+    if (actionKey) snapshotsByAction.set(actionKey, snapshot);
+  }
+
+  const source = definitions.length ? definitions : uniqueWorkflowSnapshots(snapshots);
+  const currentStepId = stringValue(preview.status, ["currentStepId", "workflowStepId"]);
+  const nextActionKey = stringValue(preview.checkpoint, ["nextActionKey"]);
+
+  return source.map((step, index) => {
+    const actionKey = workflowActionKey(step);
+    const stepId = workflowStepId(step);
+    const snapshot = (stepId ? snapshotsByStep.get(stepId) : undefined) || (actionKey ? snapshotsByAction.get(actionKey) : undefined) || step;
+    const rawStatus = stringValue(snapshot, ["state", "status"]);
+    const status = normalizedWorkflowStatus(rawStatus, stepId === currentStepId, Boolean(actionKey && actionKey === nextActionKey));
+    const config = workflowStepConfig(step);
+    const taskSnapshots = asRecordArray(snapshot.tasks);
+    const taskStatusByKey = new Map(taskSnapshots.map((task) => [stringValue(task, ["key", "task_key"]), stringValue(task, ["status", "state"])]));
+
+    return {
+      key: stepId || actionKey || `step-${index}`,
+      index: index + 1,
+      name: stringValue(step, ["name", "title"], `Schritt ${index + 1}`),
+      actionKey,
+      type: stringValue(step, ["type"], stringValue(config, ["type"])),
+      status,
+      message: stringValue(snapshot, ["statusMessage", "message"], stringValue(config, ["description"])),
+      tasks: workflowStepTasks(step).map((task) => {
+        const key = stringValue(task, ["key", "task_key"]);
+        return {
+          key,
+          title: stringValue(task, ["title", "name"], key || "Task"),
+          status: taskStatusByKey.get(key) || stringValue(task, ["status", "state"], "configured"),
+        };
+      }),
+      routes: workflowStepRoutes(step),
+    };
+  });
+});
 
 function setFeedback(message: string, type: FeedbackType = "info") {
   feedback.value = message;
@@ -215,6 +296,75 @@ function readableDetails(raw: string) {
   } catch {
     return raw;
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function asRecordArray(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.map(asRecord).filter((item): item is Record<string, unknown> => Boolean(item)) : [];
+}
+
+function stringValue(record: Record<string, unknown> | null | undefined, keys: string[], fallback = "") {
+  if (!record) return fallback;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim() !== "") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return fallback;
+}
+
+function workflowStepId(step: Record<string, unknown>) {
+  return stringValue(step, ["workflowStepId", "workflow_step_id", "id"]);
+}
+
+function workflowActionKey(step: Record<string, unknown>) {
+  return stringValue(step, ["actionKey", "action_key"]);
+}
+
+function workflowStepConfig(step: Record<string, unknown>): Record<string, unknown> {
+  return asRecord(step.config) || asRecord(step.config_json) || {};
+}
+
+function workflowStepTasks(step: Record<string, unknown>) {
+  const configTasks = asRecordArray(workflowStepConfig(step)["tasks"]);
+  return configTasks.length ? configTasks : asRecordArray(step.tasks);
+}
+
+function workflowStepRoutes(step: Record<string, unknown>): WorkflowRoutePreview[] {
+  const routes = asRecord(workflowStepConfig(step)["routes"]) || asRecord(step.routes);
+  if (!routes) return [];
+
+  return Object.entries(routes).map(([outcome, route]) => {
+    const record = asRecord(route) || {};
+    const target = stringValue(record, ["action_key", "step", "card", "target", "type"]);
+    return {
+      outcome,
+      target,
+      label: stringValue(record, ["label"], target),
+    };
+  }).filter((route) => route.target || route.label);
+}
+
+function uniqueWorkflowSnapshots(snapshots: Array<Record<string, unknown>>) {
+  const seen = new Set<string>();
+  return snapshots.filter((snapshot, index) => {
+    const key = workflowStepId(snapshot) || workflowActionKey(snapshot) || `snapshot-${index}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function normalizedWorkflowStatus(status: string, isCurrent: boolean, isNext: boolean) {
+  const normalized = status.toLowerCase();
+  if (["completed", "success"].includes(normalized)) return "completed";
+  if (["failed", "error", "timed_out", "timeout", "cancelled", "canceled", "lost"].includes(normalized)) return normalized === "timeout" ? "timed_out" : normalized;
+  if (isCurrent) return "running";
+  if (isNext) return "waiting";
+  return normalized || "queued";
 }
 
 function isWorkflowProcess(process: LocalProcess) {
@@ -346,6 +496,29 @@ onUnmounted(() => {
         <section class="preview-dialog">
           <header><div><p class="eyebrow">Workflow-Vorschau</p><h2>{{ workflowPreview.job_uuid }}</h2></div><button class="button ghost" @click="closeWorkflowPreview">Schliessen</button></header>
           <div class="preview-toolbar"><span :class="['pill', String(workflowPreview.status.state || '')]">{{ workflowPreview.status.state || 'unbekannt' }}</span><button class="button primary small" @click="exportWorkflowDebug(workflowPreview.job_uuid)">Debug exportieren</button></div>
+          <section class="workflow-map">
+            <div class="workflow-map-heading">
+              <div><h3>Ablaufdiagramm</h3><p>{{ workflowStepTimeline.length }} Schritt(e) im lokalen Workflow-Kontext.</p></div>
+              <span :class="['pill', String(workflowPreview.checkpoint.nextActionKey ? 'waiting' : workflowPreview.status.state || '')]">{{ workflowPreview.checkpoint.nextActionKey ? `Nächster Schritt: ${workflowPreview.checkpoint.nextActionKey}` : workflowPreview.status.state || 'unbekannt' }}</span>
+            </div>
+            <div v-if="workflowStepTimeline.length" class="workflow-map-track">
+              <article v-for="step in workflowStepTimeline" :key="step.key" :class="['workflow-step-card', step.status]">
+                <div class="workflow-step-head">
+                  <span class="workflow-step-index">{{ step.index }}</span>
+                  <div><strong>{{ step.name }}</strong><small>{{ step.actionKey || step.type || "ohne Action-Key" }}</small></div>
+                  <span :class="['pill', step.status]">{{ step.status }}</span>
+                </div>
+                <p v-if="step.message">{{ step.message }}</p>
+                <div v-if="step.tasks.length" class="workflow-task-list">
+                  <span v-for="task in step.tasks" :key="task.key || task.title" :class="['workflow-task-chip', task.status]">{{ task.title }}</span>
+                </div>
+                <div v-if="step.routes.length" class="workflow-route-list">
+                  <span v-for="route in step.routes" :key="`${step.key}-${route.outcome}`"><b>{{ route.outcome }}</b>{{ route.label || route.target }}</span>
+                </div>
+              </article>
+            </div>
+            <div v-else class="empty-card">Für diesen Prozess wurden noch keine Workflow-Schritte gespeichert.</div>
+          </section>
           <img v-if="workflowPreview.screenshot_data_url" :src="workflowPreview.screenshot_data_url" alt="Live Workflow Screenshot" class="preview-image">
           <div v-else class="empty-card">Noch kein Screenshot vorhanden.</div>
           <div class="preview-columns">
@@ -365,5 +538,5 @@ onUnmounted(() => {
 
 <style scoped>
 :global(*){box-sizing:border-box}:global(body){margin:0;background:#f4f7fb;color:#172033;font-family:Inter,"Segoe UI",sans-serif}:global(button),:global(input),:global(textarea){font:inherit}.app-shell{min-height:100vh;display:grid;grid-template-columns:260px minmax(0,1fr)}.sidebar{position:fixed;inset:0 auto 0 0;width:260px;display:flex;flex-direction:column;padding:22px 16px;background:#0b1220;color:#fff;border-right:1px solid #1d293b}.brand{display:flex;align-items:center;gap:12px;padding:0 8px 22px}.brand-mark{display:grid;width:42px;height:42px;place-items:center;border-radius:12px;background:linear-gradient(135deg,#06b6d4,#2563eb);font-weight:900}.brand strong,.brand span{display:block}.brand span{margin-top:2px;font-size:12px;color:#8794aa}.node-state{display:flex;align-items:center;gap:10px;margin:0 4px 20px;padding:12px;border:1px solid #243044;border-radius:12px;background:#111b2d}.node-state strong,.node-state span{display:block;font-size:12px}.node-state span{color:#8b98ad}.state-dot{width:9px;height:9px;border-radius:50%;background:#64748b;box-shadow:0 0 0 4px #64748b22}.state-dot.online{background:#34d399;box-shadow:0 0 0 4px #34d39922}.menu{display:grid;gap:5px}.menu-item{position:relative;display:flex;align-items:center;gap:12px;width:100%;padding:11px 13px;border:0;border-radius:10px;background:transparent;color:#9ba8bc;text-align:left;cursor:pointer}.menu-item:hover{background:#152136;color:#fff}.menu-item.active{background:linear-gradient(90deg,#1d4ed8,#2563eb);color:#fff;box-shadow:0 8px 20px #1d4ed833}.menu-icon{width:20px;text-align:center;font-size:18px}.menu-badge{margin-left:auto!important;display:grid!important;min-width:20px;height:20px;place-items:center;border-radius:10px;background:#ffffff24;color:#fff!important;font-size:10px!important;font-weight:800}.sidebar-footer{margin-top:auto;padding:16px 8px 4px;border-top:1px solid #223047}.sidebar-footer span,.sidebar-footer code{display:block}.sidebar-footer span{margin-bottom:5px;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#64748b}.sidebar-footer code{overflow:hidden;color:#94a3b8;font-size:10px;text-overflow:ellipsis}.workspace{grid-column:2;min-width:0;padding:26px 30px 40px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:18px}.eyebrow{margin:0 0 5px;color:#2563eb;font-size:10px;font-weight:800;letter-spacing:.19em;text-transform:uppercase}.eyebrow.light{color:#67e8f9}.topbar h1{margin:0;font-size:26px}.top-actions{display:flex;gap:9px}.button{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:9px;padding:10px 15px;font-size:13px;font-weight:700;cursor:pointer}.button:disabled{opacity:.55;cursor:not-allowed}.button.primary{background:#2563eb;color:#fff;box-shadow:0 7px 15px #2563eb25}.button.ghost{border:1px solid #d8e0eb;background:#fff;color:#475569}.button.small{padding:7px 10px;font-size:11px}.feedback{margin-bottom:18px;padding:11px 14px;border:1px solid #dbe4ef;border-radius:9px;background:#fff;color:#475569;font-size:12px}.feedback.success{border-color:#a7f3d0;background:#ecfdf5;color:#047857}.feedback.error{border-color:#fecaca;background:#fef2f2;color:#b91c1c}.hero-card{display:flex;align-items:center;justify-content:space-between;gap:30px;padding:28px;border-radius:17px;background:radial-gradient(circle at 85% 15%,#164e63 0,transparent 35%),linear-gradient(135deg,#0f172a,#111827);color:#fff;box-shadow:0 18px 35px #0f172a20}.hero-card h2{margin:4px 0 8px;font-size:24px}.hero-card p{max-width:680px;margin:0;color:#aebbd0;font-size:13px;line-height:1.6}.hero-status{width:250px;padding:15px;border:1px solid #ffffff1f;border-radius:12px;background:#ffffff0d}.hero-status span,.hero-status strong,.hero-status small{display:block}.hero-status span{font-size:10px;color:#93a4ba;text-transform:uppercase}.hero-status strong{margin:4px 0;font-size:20px}.hero-status small{overflow:hidden;color:#93a4ba;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:18px 0}.metric,.panel{border:1px solid #dfe6ef;border-radius:14px;background:#fff;box-shadow:0 6px 18px #17203308}.metric{padding:18px}.metric span,.metric strong,.metric small{display:block}.metric span{color:#64748b;font-size:11px;font-weight:700}.metric strong{margin:7px 0 4px;font-size:25px}.metric small{color:#94a3b8;font-size:10px}.panel{padding:20px}.panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px}.panel-heading h2{margin:0;font-size:17px}.panel-heading p{margin:4px 0 0;color:#738096;font-size:12px}.action-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.action-card{padding:16px;border:1px solid #e1e7ef;border-radius:11px;background:#f9fbfd;text-align:left;cursor:pointer}.action-card:hover{border-color:#93c5fd;background:#eff6ff;transform:translateY(-1px)}.action-card span,.action-card strong,.action-card small{display:block}.action-card span{margin-bottom:18px;color:#2563eb;font:700 11px monospace}.action-card strong{font-size:13px}.action-card small{margin-top:5px;color:#8390a4;font-size:10px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th{padding:10px 12px;background:#f8fafc;color:#64748b;font-size:10px;text-align:left;text-transform:uppercase}td{padding:13px 12px;border-top:1px solid #edf1f6;font-size:12px}td strong,td code{display:block}td code{margin-top:4px;color:#7c8ba1;font-size:10px}.pill{display:inline-flex;border-radius:99px;padding:4px 8px;background:#e2e8f0;color:#475569;font-size:9px;font-weight:800;text-transform:uppercase}.pill.online,.pill.success{background:#d1fae5;color:#047857}.pill.running,.pill.busy{background:#dbeafe;color:#1d4ed8}.pill.failed,.pill.error{background:#fee2e2;color:#b91c1c}.empty{padding:35px;text-align:center;color:#94a3b8}.process-list,.event-list{display:grid;gap:9px}.process-row{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:13px;align-items:start;padding:14px;border:1px solid #e4eaf2;border-radius:11px}.process-icon{display:grid;width:38px;height:38px;place-items:center;border-radius:10px;background:#e2e8f0;color:#475569;font-weight:900}.process-icon.running{background:#dbeafe;color:#2563eb}.process-icon.success{background:#d1fae5;color:#059669}.process-icon.failed{background:#fee2e2;color:#dc2626}.process-title{display:flex;align-items:center;gap:9px}.process-main>code{display:block;margin:4px 0;color:#8996aa;font-size:10px}.process-row time{color:#94a3b8;font-size:10px}.process-row details{margin-top:7px}.process-row summary{color:#64748b;font-size:10px;cursor:pointer}.process-row pre{max-height:180px;overflow:auto;padding:10px;border-radius:8px;background:#0f172a;color:#cbd5e1;font-size:10px;white-space:pre-wrap}.live-indicator{display:flex;align-items:center;gap:6px;color:#059669;font-size:11px;font-weight:700}.live-indicator i{width:7px;height:7px;border-radius:50%;background:#10b981;box-shadow:0 0 0 4px #10b9811f}.empty-card{padding:35px;border:1px dashed #cbd5e1;border-radius:10px;color:#94a3b8;text-align:center;font-size:12px}.form-grid{display:grid;grid-template-columns:1fr 2fr auto;gap:10px;margin-bottom:17px}.event-list article{display:grid;grid-template-columns:180px minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px;border:1px solid #e4eaf2;border-radius:10px}.event-list strong,.event-list span{display:block}.event-list strong{font-size:12px}.event-list span{margin-top:3px;color:#94a3b8;font-size:9px}.event-list code{overflow:hidden;color:#64748b;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}label{display:block;margin:8px 0 6px;color:#475569;font-size:11px;font-weight:700}input,textarea{width:100%;border:1px solid #d5deea;border-radius:9px;padding:10px 12px;background:#fff;color:#1e293b;font-size:12px;outline:none}input:focus,textarea:focus{border-color:#60a5fa;box-shadow:0 0 0 3px #60a5fa20}.settings-grid .button{margin-top:12px}.settings-grid dl{display:grid;gap:12px;margin:0}.settings-grid dl div{display:grid;grid-template-columns:130px minmax(0,1fr);gap:12px}.settings-grid dt{color:#64748b;font-size:11px}.settings-grid dd{min-width:0;margin:0;font-size:11px}.settings-grid dd code{display:block;overflow:hidden;color:#475569;text-overflow:ellipsis;white-space:nowrap}.busy-overlay{position:fixed;inset:0 0 0 260px;display:grid;z-index:50;place-items:center;background:#0f172a30;backdrop-filter:blur(2px)}.busy-overlay>div{padding:22px 30px;border-radius:13px;background:#fff;box-shadow:0 20px 50px #0f172a30;text-align:center}.busy-overlay p{margin:10px 0 0;font-size:12px}.spinner{width:14px;height:14px;border:2px solid #ffffff55;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}.spinner.large{display:inline-block;width:26px;height:26px;border-color:#dbeafe;border-top-color:#2563eb}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:1000px){.app-shell{grid-template-columns:210px minmax(0,1fr)}.sidebar{width:210px}.workspace{padding:20px}.stats-grid,.action-grid{grid-template-columns:repeat(2,1fr)}.busy-overlay{left:210px}.settings-grid{grid-template-columns:1fr}}@media(max-width:720px){.app-shell{display:block}.sidebar{position:static;width:auto;min-height:auto}.menu{grid-template-columns:repeat(5,1fr)}.menu-item{justify-content:center;padding:9px}.menu-item>span:not(.menu-icon){display:none}.sidebar-footer,.node-state{display:none}.workspace{grid-column:auto;padding:15px}.topbar,.hero-card{align-items:flex-start;flex-direction:column}.stats-grid,.action-grid{grid-template-columns:1fr 1fr}.form-grid,.event-list article{grid-template-columns:1fr}.busy-overlay{left:0}}
-.process-actions{display:flex;gap:8px;margin-top:9px}.preview-overlay{position:fixed;inset:0;display:grid;z-index:70;place-items:center;padding:24px;background:#0f172a99;backdrop-filter:blur(3px)}.preview-dialog{width:min(1100px,96vw);max-height:92vh;overflow:auto;padding:22px;border-radius:15px;background:#fff;box-shadow:0 25px 70px #02061766}.preview-dialog>header,.preview-toolbar{display:flex;align-items:center;justify-content:space-between;gap:15px}.preview-dialog h2{max-width:760px;margin:0;overflow:hidden;font-size:17px;text-overflow:ellipsis;white-space:nowrap}.preview-toolbar{margin:14px 0}.preview-image{display:block;width:100%;max-height:520px;object-fit:contain;border:1px solid #dbe3ee;border-radius:10px;background:#0f172a}.preview-columns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px}.preview-columns details{min-width:0;padding:10px;border:1px solid #e2e8f0;border-radius:9px}.preview-columns summary{cursor:pointer;color:#475569;font-size:11px;font-weight:700}.preview-columns pre{max-height:260px;overflow:auto;padding:10px;border-radius:7px;background:#0f172a;color:#cbd5e1;font-size:10px;white-space:pre-wrap}.preview-path{display:block;margin-top:12px;overflow:hidden;color:#64748b;font-size:10px;text-overflow:ellipsis;white-space:nowrap}@media(max-width:720px){.preview-columns{grid-template-columns:1fr}.preview-overlay{padding:8px}}
+.process-actions{display:flex;gap:8px;margin-top:9px}.preview-overlay{position:fixed;inset:0;display:grid;z-index:70;place-items:center;padding:24px;background:#0f172a99;backdrop-filter:blur(3px)}.preview-dialog{width:min(1100px,96vw);max-height:92vh;overflow:auto;padding:22px;border-radius:15px;background:#fff;box-shadow:0 25px 70px #02061766}.preview-dialog>header,.preview-toolbar{display:flex;align-items:center;justify-content:space-between;gap:15px}.preview-dialog h2{max-width:760px;margin:0;overflow:hidden;font-size:17px;text-overflow:ellipsis;white-space:nowrap}.preview-toolbar{margin:14px 0}.workflow-map{margin:0 0 14px;padding:14px;border:1px solid #dbe3ee;border-radius:10px;background:#f8fafc}.workflow-map-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.workflow-map-heading h3{margin:0;font-size:15px}.workflow-map-heading p{margin:3px 0 0;color:#64748b;font-size:11px}.workflow-map-track{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px}.workflow-step-card{position:relative;flex:0 0 270px;min-height:154px;padding:12px;border:1px solid #d7e0ec;border-radius:9px;background:#fff}.workflow-step-card:after{content:"";position:absolute;top:30px;right:-10px;width:10px;height:2px;background:#cbd5e1}.workflow-step-card:last-child:after{display:none}.workflow-step-card.completed{border-color:#86efac;background:#f0fdf4}.workflow-step-card.running,.workflow-step-card.waiting{border-color:#93c5fd;background:#eff6ff}.workflow-step-card.failed,.workflow-step-card.timed_out,.workflow-step-card.cancelled{border-color:#fecaca;background:#fef2f2}.workflow-step-head{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:9px;align-items:start}.workflow-step-index{display:grid;width:28px;height:28px;place-items:center;border-radius:8px;background:#0f172a;color:#fff;font-size:11px;font-weight:800}.workflow-step-head strong,.workflow-step-head small{display:block}.workflow-step-head strong{overflow:hidden;font-size:12px;text-overflow:ellipsis;white-space:nowrap}.workflow-step-head small{margin-top:2px;overflow:hidden;color:#64748b;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.workflow-step-card>p{display:-webkit-box;min-height:32px;margin:9px 0;color:#475569;font-size:11px;line-height:1.45;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.workflow-task-list,.workflow-route-list{display:flex;flex-wrap:wrap;gap:5px}.workflow-task-chip,.workflow-route-list span{max-width:100%;overflow:hidden;border-radius:7px;padding:4px 6px;background:#e2e8f0;color:#475569;font-size:9px;font-weight:700;text-overflow:ellipsis;white-space:nowrap}.workflow-task-chip.success,.workflow-task-chip.completed{background:#bbf7d0;color:#047857}.workflow-task-chip.failed,.workflow-task-chip.timed_out{background:#fecaca;color:#b91c1c}.workflow-route-list{margin-top:8px}.workflow-route-list span{background:#eef2ff;color:#3730a3}.workflow-route-list b{margin-right:4px;color:#1e293b}.preview-image{display:block;width:100%;max-height:520px;object-fit:contain;border:1px solid #dbe3ee;border-radius:10px;background:#0f172a}.preview-columns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px}.preview-columns details{min-width:0;padding:10px;border:1px solid #e2e8f0;border-radius:9px}.preview-columns summary{cursor:pointer;color:#475569;font-size:11px;font-weight:700}.preview-columns pre{max-height:260px;overflow:auto;padding:10px;border-radius:7px;background:#0f172a;color:#cbd5e1;font-size:10px;white-space:pre-wrap}.preview-path{display:block;margin-top:12px;overflow:hidden;color:#64748b;font-size:10px;text-overflow:ellipsis;white-space:nowrap}@media(max-width:720px){.preview-columns{grid-template-columns:1fr}.preview-overlay{padding:8px}.workflow-map-heading{display:block}.workflow-step-card{flex-basis:235px}}
 </style>

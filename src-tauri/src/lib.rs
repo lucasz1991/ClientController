@@ -130,6 +130,7 @@ struct WorkflowProcessPreview {
     status: Value,
     result: Value,
     checkpoint: Value,
+    workflow_steps: Value,
     screenshot_data_url: Option<String>,
     stdout_tail: String,
     stderr_tail: String,
@@ -2114,6 +2115,11 @@ fn workflow_process_preview_internal(
         status: read_json_file(&run_directory.join("status.json")),
         result,
         checkpoint: read_json_file(&run_directory.join("workflow-checkpoint.json")),
+        workflow_steps: read_json_file(&run_directory.join("workflow-bundle.json"))
+            .get("steps")
+            .cloned()
+            .filter(Value::is_array)
+            .unwrap_or_else(|| json!([])),
         screenshot_data_url,
         stdout_tail: read_file_tail(&run_directory.join("stdout.log"), 32_000),
         stderr_tail: read_file_tail(&run_directory.join("stderr.log"), 32_000),
@@ -2209,6 +2215,7 @@ fn export_workflow_process_debug_internal(
         "status.json",
         "result.json",
         "workflow-checkpoint.json",
+        "workflow-bundle.json",
         "runtime.json",
     ] {
         let source = run_directory.join(name);
@@ -2235,6 +2242,7 @@ fn export_workflow_process_debug_internal(
             "status": redact_debug_value(&preview.status),
             "result": redact_debug_value(&preview.result),
             "checkpoint": redact_debug_value(&preview.checkpoint),
+            "workflowSteps": redact_debug_value(&preview.workflow_steps),
             "localProcesses": redact_debug_value(&serde_json::to_value(processes).unwrap_or_else(|_| json!([]))),
         }),
     )?;
@@ -2689,6 +2697,11 @@ fn write_full_workflow_snapshot(
         .map_err(|e| format!("create full workflow directory failed: {e}"))?;
     let status_path = run_dir.join("status.json");
     let preview_path = run_dir.join("live.png");
+    let workflow_steps = read_json_file(&run_dir.join("workflow-bundle.json"))
+        .get("steps")
+        .cloned()
+        .filter(Value::is_array)
+        .unwrap_or_else(|| json!([]));
     let snapshot = json!({
         "runId": job.job_uuid,
         "state": state,
@@ -2698,6 +2711,7 @@ fn write_full_workflow_snapshot(
         "currentStepId": current_step.and_then(|step| step.get("workflowStepId")).cloned(),
         "currentStepRunId": current_step.and_then(|step| step.get("workflowStepRunId")).cloned(),
         "steps": step_results,
+        "workflowSteps": workflow_steps,
         "workflow": context,
         "browserWindows": context.get("browserWindows").cloned(),
         "browserWsEndpoint": context.get("browserWsEndpoint").cloned(),
@@ -2744,6 +2758,12 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         .join(&job.job_uuid);
     fs::create_dir_all(&run_dir)
         .map_err(|e| format!("create workflow run directory failed: {e}"))?;
+    fs::write(
+        run_dir.join("workflow-bundle.json"),
+        serde_json::to_vec_pretty(&bundle)
+            .map_err(|e| format!("serialize workflow bundle failed: {e}"))?,
+    )
+    .map_err(|e| format!("write workflow bundle failed: {e}"))?;
     let checkpoint_path = run_dir.join("workflow-checkpoint.json");
     let workflow_status_path = run_dir.join("status.json");
     let workflow_preview_path = run_dir.join("live.png");
