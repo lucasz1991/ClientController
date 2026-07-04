@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tar::{Archive, Builder};
 use tauri::Manager;
-use tauri_plugin_updater::UpdaterExt;
 
 const DEFAULT_SERVER_DOMAIN: &str = "https://factory.follow-flow.de";
 const DEFAULT_BOOTSTRAP_API_KEY: &str = "followflow-default-node-key-change-me";
@@ -3195,65 +3194,8 @@ fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Va
 }
 
 fn execute_node_update(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value, String> {
-    let manifest_url = job
-        .payload
-        .get("manifest_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| value.starts_with("https://"))
-        .ok_or_else(|| "update manifest_url must use HTTPS".to_string())?;
-    let public_key = job
-        .payload
-        .get("updater_public_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "update public key is missing".to_string())?;
-    let target_version = job
-        .payload
-        .get("target_version")
-        .and_then(Value::as_str)
-        .map(|value| value.trim().trim_start_matches(['v', 'V']).to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "update target_version is missing".to_string())?;
-    let endpoint = manifest_url
-        .parse()
-        .map_err(|e| format!("invalid update manifest URL: {e}"))?;
-
-    let updater = app
-        .updater_builder()
-        .endpoints(vec![endpoint])
-        .map_err(|e| format!("configure update endpoint failed: {e}"))?
-        .pubkey(public_key)
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("build updater failed: {e}"))?;
-    let update = tauri::async_runtime::block_on(updater.check())
-        .map_err(|e| format!("check signed update failed: {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "updater manifest contains no update newer than {}",
-                env!("CARGO_PKG_VERSION")
-            )
-        })?;
-    let offered_version = update
-        .version
-        .trim()
-        .trim_start_matches(['v', 'V'])
-        .to_string();
-
-    if offered_version != target_version {
-        return Err(format!(
-            "updater offered version {offered_version}, but the approved target is {target_version}"
-        ));
-    }
-
-    tauri::async_runtime::block_on(
-        update.download_and_install(|_chunk_length, _content_length| {}, || {}),
-    )
-    .map_err(|e| format!("download or installation of signed update failed: {e}"))?;
-
-    app.restart();
+    let _ = (app, job);
+    Err("node_update is currently disabled in this ClientController build".to_string())
 }
 
 struct WorkflowJobGuard(bool);
@@ -3698,7 +3640,7 @@ fn get_client_status(app: tauri::AppHandle) -> Result<ClientStatus, String> {
             .unwrap_or_default(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         running_processes,
-        updater_available: true,
+        updater_available: false,
     })
 }
 
@@ -4020,8 +3962,6 @@ fn run_full_sync(app: tauri::AppHandle) -> Result<SyncSummary, String> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            app.handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())?;
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let _ = bootstrap_local_runtime(handle.clone());
