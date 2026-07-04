@@ -1,5 +1,6 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use flate2::read::GzDecoder;
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -7,13 +8,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tar::Archive;
+use tar::{Archive, Builder};
 use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -121,6 +123,18 @@ struct LocalProcess {
     status: String,
     details_json: String,
     created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowProcessPreview {
+    job_uuid: String,
+    status: Value,
+    result: Value,
+    checkpoint: Value,
+    screenshot_data_url: Option<String>,
+    stdout_tail: String,
+    stderr_tail: String,
+    run_directory: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2034,6 +2048,210 @@ fn local_processes_internal(
     Ok(processes)
 }
 
+fn validated_job_uuid(job_uuid: &str) -> Result<&str, String> {
+    let job_uuid = job_uuid.trim();
+    if job_uuid.is_empty()
+        || !job_uuid
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("invalid workflow job UUID".to_string());
+    }
+    Ok(job_uuid)
+}
+
+fn workflow_job_directory(app: &tauri::AppHandle, job_uuid: &str) -> Result<PathBuf, String> {
+    Ok(ensure_runtime_dir(app)?
+        .join("workflow-jobs")
+        .join(validated_job_uuid(job_uuid)?))
+}
+
+fn read_json_file(path: &Path) -> Value {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn read_file_tail(path: &Path, maximum_bytes: usize) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    let start = bytes.len().saturating_sub(maximum_bytes);
+    String::from_utf8_lossy(&bytes[start..]).to_string()
+}
+
+fn workflow_process_preview_internal(
+    app: &tauri::AppHandle,
+    job_uuid: &str,
+) -> Result<WorkflowProcessPreview, String> {
+    let job_uuid = validated_job_uuid(job_uuid)?.to_string();
+    let run_directory = workflow_job_directory(app, &job_uuid)?;
+    if !run_directory.is_dir() {
+        return Err(format!("workflow run directory not found: {job_uuid}"));
+    }
+
+    let mut result = read_json_file(&run_directory.join("result.json"));
+    if let Some(process) = local_processes_internal(app, 250)?
+        .into_iter()
+        .find(|process| process.job_id.as_deref() == Some(job_uuid.as_str()))
+    {
+        if process.status != "running"
+            || result
+                .as_object()
+                .map(|object| object.is_empty())
+                .unwrap_or(true)
+        {
+            result = serde_json::from_str(&process.details_json).unwrap_or_else(|_| json!({}));
+        }
+    }
+    let screenshot_path = run_directory.join("live.png");
+    let screenshot_data_url = fs::read(&screenshot_path)
+        .ok()
+        .map(|bytes| format!("data:image/png;base64,{}", BASE64.encode(bytes)));
+
+    Ok(WorkflowProcessPreview {
+        job_uuid,
+        status: read_json_file(&run_directory.join("status.json")),
+        result,
+        checkpoint: read_json_file(&run_directory.join("workflow-checkpoint.json")),
+        screenshot_data_url,
+        stdout_tail: read_file_tail(&run_directory.join("stdout.log"), 32_000),
+        stderr_tail: read_file_tail(&run_directory.join("stderr.log"), 32_000),
+        run_directory: run_directory.to_string_lossy().to_string(),
+    })
+}
+
+fn append_debug_json<W: Write>(
+    archive: &mut Builder<W>,
+    path: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(payload)
+        .map_err(|error| format!("serialize debug payload failed: {error}"))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o600);
+    header.set_mtime(Utc::now().timestamp().max(0) as u64);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, path, bytes.as_slice())
+        .map_err(|error| format!("append debug payload failed: {error}"))
+}
+
+fn redact_debug_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    let sensitive = [
+                        "password",
+                        "secret",
+                        "apikey",
+                        "leasetoken",
+                        "sessionpayload",
+                        "encrypted",
+                        "cookies",
+                        "localstorage",
+                        "sessionstorage",
+                        "wsendpoint",
+                    ]
+                    .iter()
+                    .any(|candidate| normalized.contains(candidate));
+                    (
+                        key.clone(),
+                        if sensitive {
+                            Value::String("[redacted]".to_string())
+                        } else {
+                            redact_debug_value(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_debug_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn export_workflow_process_debug_internal(
+    app: &tauri::AppHandle,
+    job_uuid: &str,
+) -> Result<String, String> {
+    let preview = workflow_process_preview_internal(app, job_uuid)?;
+    let run_directory = workflow_job_directory(app, &preview.job_uuid)?;
+    let export_directory = app
+        .path()
+        .download_dir()
+        .unwrap_or(ensure_runtime_dir(app)?.join("debug-exports"));
+    fs::create_dir_all(&export_directory)
+        .map_err(|error| format!("create debug export directory failed: {error}"))?;
+    let export_path = export_directory.join(format!(
+        "workflow-debug-client-{}-{}.tar.gz",
+        preview.job_uuid,
+        Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    let file = fs::File::create(&export_path)
+        .map_err(|error| format!("create workflow debug export failed: {error}"))?;
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut archive = Builder::new(encoder);
+
+    for name in ["stdout.log", "stderr.log", "live.png", "live-dom.json"] {
+        let source = run_directory.join(name);
+        if source.is_file() {
+            archive
+                .append_path_with_name(&source, format!("workflow-debug/files/{name}"))
+                .map_err(|error| format!("append {name} to debug export failed: {error}"))?;
+        }
+    }
+    for name in [
+        "status.json",
+        "result.json",
+        "workflow-checkpoint.json",
+        "runtime.json",
+    ] {
+        let source = run_directory.join(name);
+        if source.is_file() {
+            append_debug_json(
+                &mut archive,
+                &format!("workflow-debug/files/{name}"),
+                &redact_debug_value(&read_json_file(&source)),
+            )?;
+        }
+    }
+
+    let processes = local_processes_internal(app, 250)?
+        .into_iter()
+        .filter(|process| process.job_id.as_deref() == Some(preview.job_uuid.as_str()))
+        .collect::<Vec<_>>();
+    append_debug_json(
+        &mut archive,
+        "workflow-debug/manifest.json",
+        &json!({
+            "exportedAt": now_iso(),
+            "jobUuid": preview.job_uuid,
+            "runDirectory": preview.run_directory,
+            "status": redact_debug_value(&preview.status),
+            "result": redact_debug_value(&preview.result),
+            "checkpoint": redact_debug_value(&preview.checkpoint),
+            "localProcesses": redact_debug_value(&serde_json::to_value(processes).unwrap_or_else(|_| json!([]))),
+        }),
+    )?;
+    archive
+        .finish()
+        .map_err(|error| format!("finish workflow debug archive failed: {error}"))?;
+    let encoder = archive
+        .into_inner()
+        .map_err(|error| format!("close workflow debug archive failed: {error}"))?;
+    encoder
+        .finish()
+        .map_err(|error| format!("close workflow debug compression failed: {error}"))?;
+
+    Ok(export_path.to_string_lossy().to_string())
+}
+
 fn interrupted_workflow_job_ids(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
     init_db(app)?;
     let conn = open_db(app)?;
@@ -3493,6 +3711,22 @@ fn get_local_processes(
 }
 
 #[tauri::command]
+fn get_workflow_process_preview(
+    app: tauri::AppHandle,
+    job_uuid: String,
+) -> Result<WorkflowProcessPreview, String> {
+    workflow_process_preview_internal(&app, &job_uuid)
+}
+
+#[tauri::command]
+fn export_workflow_process_debug(
+    app: tauri::AppHandle,
+    job_uuid: String,
+) -> Result<String, String> {
+    export_workflow_process_debug_internal(&app, &job_uuid)
+}
+
+#[tauri::command]
 fn update_server_domain(
     app: tauri::AppHandle,
     server_domain: String,
@@ -3804,6 +4038,8 @@ pub fn run() {
             bootstrap_local_runtime,
             get_client_status,
             get_local_processes,
+            get_workflow_process_preview,
+            export_workflow_process_debug,
             update_server_domain,
             queue_event_local,
             get_pending_events,

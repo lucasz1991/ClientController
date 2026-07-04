@@ -1,6 +1,6 @@
 [package]
 name = "clientcontroller"
-version = "0.1.2"
+version = "0.1.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -31,3 +31,4 @@ sha2 = "0.10"
 hex = "0.4"
 flate2 = "1"
 tar = "0.4"
+base64 = "0.22"

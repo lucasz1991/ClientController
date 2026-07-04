@@ -496,8 +496,9 @@ dependencies = [
 
 [[package]]
 name = "clientcontroller"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "flate2",
  "hex",
