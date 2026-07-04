@@ -1214,10 +1214,7 @@ fn local_cpu_load_percent() -> Option<f64> {
 #[cfg(not(target_os = "windows"))]
 fn local_cpu_load_percent() -> Option<f64> {
     let output = Command::new("sh")
-        .args([
-            "-c",
-            "ps -A -o %cpu= | awk '{s+=$1} END {print s}'",
-        ])
+        .args(["-c", "ps -A -o %cpu= | awk '{s+=$1} END {print s}'"])
         .output()
         .ok()?;
 
@@ -2565,7 +2562,11 @@ fn workflow_task_hard_timeout_seconds(runtime: &Value) -> u64 {
         .map(|tasks| {
             tasks
                 .iter()
-                .map(|task| task.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(60))
+                .map(|task| {
+                    task.get("timeout_seconds")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(60)
+                })
                 .sum::<u64>()
         })
         .unwrap_or(60);
@@ -2594,6 +2595,23 @@ fn workflow_task_release_on_result(runtime: &Value) -> bool {
     )
 }
 
+fn chromium_no_sandbox_enabled(runtime: &Value) -> bool {
+    [
+        "chromiumNoSandbox",
+        "chromium_no_sandbox",
+        "disableChromiumSandbox",
+        "disable_chromium_sandbox",
+    ]
+    .iter()
+    .any(|key| {
+        runtime.get(*key).is_some_and(|value| {
+            value.as_bool().unwrap_or(false)
+                || value.as_u64() == Some(1)
+                || matches!(value.as_str(), Some("true") | Some("1"))
+        })
+    })
+}
+
 fn workflow_task_finished_result(result_path: &Path) -> Option<Value> {
     let result = fs::read_to_string(result_path)
         .ok()
@@ -2606,7 +2624,10 @@ fn workflow_task_finished_result(result_path: &Path) -> Option<Value> {
     let status = result.get("status").and_then(Value::as_str).unwrap_or("");
 
     if result.get("finishedAt").is_some()
-        || matches!(status, "success" | "failed" | "timed_out" | "timeout" | "cancelled" | "canceled")
+        || matches!(
+            status,
+            "success" | "failed" | "timed_out" | "timeout" | "cancelled" | "canceled"
+        )
     {
         return Some(result);
     }
@@ -2636,7 +2657,9 @@ fn enrich_workflow_task_result(mut result: Value) -> Value {
                     .and_then(Value::as_array)
                     .and_then(|tasks| {
                         tasks.iter().rev().find_map(|task| {
-                            task.get(path_key).and_then(Value::as_str).map(str::to_string)
+                            task.get(path_key)
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
                         })
                     })
             });
@@ -2732,8 +2755,8 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         "runnerDiagnostics": {
             "releaseOnFinishedResult": release_on_finished_result,
             "hardTimeoutSeconds": hard_timeout_seconds,
-            "chromiumNoSandboxFlag": cfg!(target_os = "linux"),
-            "chromiumNoSandboxNote": "--no-sandbox erzeugt einen Chromium-Warnhinweis, ist aber nicht automatisch ein Steuerungsfehler.",
+            "chromiumNoSandboxFlag": cfg!(target_os = "linux") && chromium_no_sandbox_enabled(&runtime),
+            "chromiumNoSandboxNote": "Die Chromium-Sandbox bleibt standardmaessig aktiv. --no-sandbox wird nur bei expliziter Runtime-Konfiguration gesetzt.",
             "runtimeManifest": runtime_manifest.clone(),
         },
         "at": now_iso(),
@@ -2784,6 +2807,7 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         .map_err(|e| format!("start workflow task process failed: {e}"))?;
     let child_pid = child.id();
     let child_started_at = Instant::now();
+    let mut finished_result_seen_at: Option<Instant> = None;
     let output_status = loop {
         match child
             .try_wait()
@@ -2808,51 +2832,65 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
 
                 if release_on_finished_result {
                     if let Some(mut result) = workflow_task_finished_result(&result_path) {
-                        if let Some(object) = result.as_object_mut() {
-                            object.insert("clientControllerRunnerReleased".to_string(), json!(true));
-                            object.insert("clientControllerRunnerReleaseReason".to_string(), json!("result-written-before-node-exit"));
-                            object.insert("clientControllerRunnerProcessId".to_string(), json!(child_pid));
-                            object.insert(
-                                "clientControllerRunnerElapsedSeconds".to_string(),
-                                json!(child_started_at.elapsed().as_secs()),
-                            );
-                        }
-                        write_workflow_runner_diagnostics(
-                            &run_dir,
-                            json!({
-                                "stage": "result-written-before-node-exit",
-                                "message": "Der Node-Runner hat ein Ergebnis geschrieben, lief aber weiter. Tauri gibt den Workflow-Schritt frei und beendet nur den Runner-Prozess.",
-                                "jobUuid": job.job_uuid,
-                                "runId": runtime.get("runId").cloned(),
-                                "childProcessId": child_pid,
-                                "elapsedSeconds": child_started_at.elapsed().as_secs(),
-                                "releaseOnFinishedResult": release_on_finished_result,
-                                "hardTimeoutSeconds": hard_timeout_seconds,
-                                "runtimeManifest": runtime_manifest.clone(),
-                                "status": read_json_file(&status_path),
-                                "result": result.clone(),
-                            }),
-                        );
-                        let _ = queue_local_event(
-                            app,
-                            "workflow_task_runner_released",
-                            json!({
-                                "job_uuid": job.job_uuid,
-                                "pid": child_pid,
-                                "elapsed_seconds": child_started_at.elapsed().as_secs(),
-                            }),
-                        );
-                        let _ = queue_job_progress_delivery(
-                            app,
-                            job,
-                            &status_path,
-                            &preview_path,
-                            live_preview_enabled,
-                        );
-                        let _ = flush_job_delivery_outbox(app, 10);
-                        terminate_child_process_only(&mut child);
+                        let result_seen_at =
+                            finished_result_seen_at.get_or_insert_with(Instant::now);
 
-                        return Ok(enrich_workflow_task_result(result));
+                        if result_seen_at.elapsed() >= Duration::from_secs(3) {
+                            if let Some(object) = result.as_object_mut() {
+                                object.insert(
+                                    "clientControllerRunnerReleased".to_string(),
+                                    json!(true),
+                                );
+                                object.insert(
+                                    "clientControllerRunnerReleaseReason".to_string(),
+                                    json!("node-exit-grace-timeout"),
+                                );
+                                object.insert(
+                                    "clientControllerRunnerProcessId".to_string(),
+                                    json!(child_pid),
+                                );
+                                object.insert(
+                                    "clientControllerRunnerElapsedSeconds".to_string(),
+                                    json!(child_started_at.elapsed().as_secs()),
+                                );
+                            }
+                            write_workflow_runner_diagnostics(
+                                &run_dir,
+                                json!({
+                                    "stage": "node-exit-grace-timeout",
+                                    "message": "Der Node-Runner hat sein Ergebnis geschrieben, den Browser aber nicht innerhalb der Karenzzeit sauber freigegeben. Nur der Runner-Prozess wird beendet.",
+                                    "jobUuid": job.job_uuid,
+                                    "runId": runtime.get("runId").cloned(),
+                                    "childProcessId": child_pid,
+                                    "elapsedSeconds": child_started_at.elapsed().as_secs(),
+                                    "releaseOnFinishedResult": release_on_finished_result,
+                                    "hardTimeoutSeconds": hard_timeout_seconds,
+                                    "runtimeManifest": runtime_manifest.clone(),
+                                    "status": read_json_file(&status_path),
+                                    "result": result.clone(),
+                                }),
+                            );
+                            let _ = queue_local_event(
+                                app,
+                                "workflow_task_runner_release_timeout",
+                                json!({
+                                    "job_uuid": job.job_uuid,
+                                    "pid": child_pid,
+                                    "elapsed_seconds": child_started_at.elapsed().as_secs(),
+                                }),
+                            );
+                            let _ = queue_job_progress_delivery(
+                                app,
+                                job,
+                                &status_path,
+                                &preview_path,
+                                live_preview_enabled,
+                            );
+                            let _ = flush_job_delivery_outbox(app, 10);
+                            terminate_child_process_only(&mut child);
+
+                            return Ok(enrich_workflow_task_result(result));
+                        }
                     }
                 }
 
@@ -2912,7 +2950,11 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
                     return Ok(timeout_result);
                 }
 
-                std::thread::sleep(Duration::from_secs(progress_interval_seconds));
+                if finished_result_seen_at.is_some() {
+                    std::thread::sleep(Duration::from_millis(250));
+                } else {
+                    std::thread::sleep(Duration::from_secs(progress_interval_seconds));
+                }
             }
         }
     };
@@ -2949,6 +2991,24 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         return;
     };
 
+    let closed_browser = result
+        .get("closedBrowser")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if closed_browser {
+        for key in [
+            "browser",
+            "browser_runtime",
+            "browserWsEndpoint",
+            "browser_ws_endpoint",
+            "browserWindows",
+            "browser_windows",
+        ] {
+            target.remove(key);
+        }
+    }
+
     for key in [
         "account",
         "new_password",
@@ -2970,6 +3030,10 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         "browserSessionDeleted",
         "deletedBrowserSession",
     ] {
+        if closed_browser && matches!(key, "browserWindows" | "browserWsEndpoint") {
+            continue;
+        }
+
         if let Some(value) = result.get(key) {
             if !value.is_null() {
                 target.insert(key.to_string(), value.clone());
@@ -2977,9 +3041,101 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         }
     }
 
-    if let Some(windows) = result.get("browserWindows") {
-        target.insert("browser_windows".to_string(), windows.clone());
+    if !closed_browser {
+        if let Some(windows) = result.get("browserWindows") {
+            target.insert("browser_windows".to_string(), windows.clone());
+        }
     }
+}
+
+fn workflow_browser_window_name(context: &Value) -> Option<String> {
+    for key in ["browserWindows", "browser_windows"] {
+        let Some(windows) = context.get(key) else {
+            continue;
+        };
+
+        if let Some(window) = windows.as_array().and_then(|items| items.first()) {
+            if let Some(name) = window
+                .get("key")
+                .or_else(|| window.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+            {
+                return Some(name.trim().to_string());
+            }
+        }
+
+        if let Some((name, _)) = windows
+            .as_object()
+            .and_then(|items| items.iter().next())
+            .filter(|(name, _)| !name.trim().is_empty())
+        {
+            return Some(name.trim().to_string());
+        }
+    }
+
+    None
+}
+
+fn close_workflow_browser_for_run(
+    app: &tauri::AppHandle,
+    job: &RemoteJob,
+    steps: &[Value],
+    context: &mut Value,
+) -> Option<Value> {
+    let browser_window = workflow_browser_window_name(context)?;
+    let browser_ws_endpoint = context
+        .get("browserWsEndpoint")
+        .or_else(|| context.get("browser_ws_endpoint"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    if browser_ws_endpoint.is_empty() {
+        return None;
+    }
+
+    let mut runtime = steps
+        .iter()
+        .find_map(|step| step.get("runtime").filter(|value| value.is_object()))
+        .cloned()?;
+    let runtime_object = runtime.as_object_mut()?;
+    runtime_object.insert("workflow".to_string(), context.clone());
+    runtime_object.insert(
+        "runId".to_string(),
+        json!(format!("{}-browser-cleanup", job.job_uuid)),
+    );
+    runtime_object.insert("workflowBundleStep".to_string(), json!(true));
+    runtime_object.insert("keepWorkflowBrowserAlive".to_string(), json!(false));
+    runtime_object.insert("closeWorkflowBrowserAtEnd".to_string(), json!(true));
+    runtime_object.insert(
+        "tasks".to_string(),
+        json!([{
+            "key": "workflow-browser-lifecycle-close",
+            "task_key": "browser.close",
+            "title": "Workflow-Browser am Workflow-Ende schliessen",
+            "kind": "browser",
+            "runner": "node",
+            "node_script": "node/workflows/tasks/browser/close.cjs",
+            "browser_window": browser_window.clone(),
+            "browser_window_name": browser_window,
+            "timeout_seconds": 30
+        }]),
+    );
+
+    let mut cleanup_job = job.clone();
+    cleanup_job.job_type = "workflow_task".to_string();
+    cleanup_job.payload = json!({"runtime": runtime});
+    let result = execute_workflow_task_job(app, &cleanup_job)
+        .unwrap_or_else(|error| json!({
+            "ok": false,
+            "status": "failed",
+            "statusMessage": format!("Workflow-Browser konnte am Workflow-Ende nicht geschlossen werden: {error}"),
+            "browserLifecycleCleanup": true,
+        }));
+    merge_workflow_context(context, &result);
+
+    Some(result)
 }
 
 fn workflow_step_route(step: &Value, result: &Value, outcome: &str) -> Value {
@@ -3201,12 +3357,14 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         let Some(step) = steps.iter().find(|step| {
             step.get("actionKey").and_then(Value::as_str).unwrap_or("") == current_action
         }) else {
+            let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
             return Ok(json!({
                 "ok": false,
                 "status": "failed",
                 "statusMessage": format!("Workflow route target was not found: {current_action}"),
                 "steps": step_results,
                 "workflow": context,
+                "browserCleanup": browser_cleanup,
             }));
         };
         let interrupted_step_status = fs::read_to_string(run_dir.join("status.json"))
@@ -3253,6 +3411,14 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                 object.insert("steps".to_string(), json!(step_results));
                 object.insert("workflow".to_string(), context.clone());
             }
+            let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
+            if let Some(object) = stopped.as_object_mut() {
+                object.insert("workflow".to_string(), context.clone());
+                object.insert(
+                    "browserCleanup".to_string(),
+                    browser_cleanup.unwrap_or(Value::Null),
+                );
+            }
             return Ok(stopped);
         }
 
@@ -3287,6 +3453,15 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                     if let Some(object) = stopped.as_object_mut() {
                         object.insert("steps".to_string(), json!(step_results));
                         object.insert("workflow".to_string(), context.clone());
+                    }
+                    let browser_cleanup =
+                        close_workflow_browser_for_run(app, job, &steps, &mut context);
+                    if let Some(object) = stopped.as_object_mut() {
+                        object.insert("workflow".to_string(), context.clone());
+                        object.insert(
+                            "browserCleanup".to_string(),
+                            browser_cleanup.unwrap_or(Value::Null),
+                        );
                     }
                     return Ok(stopped);
                 }
@@ -3369,6 +3544,14 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                 object.insert("steps".to_string(), json!(step_results));
                 object.insert("workflow".to_string(), context.clone());
             }
+            let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
+            if let Some(object) = step_result.as_object_mut() {
+                object.insert("workflow".to_string(), context.clone());
+                object.insert(
+                    "browserCleanup".to_string(),
+                    browser_cleanup.unwrap_or(Value::Null),
+                );
+            }
             return Ok(step_result);
         }
         merge_workflow_context(&mut context, &step_result);
@@ -3393,12 +3576,14 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         if route_type == "end" {
             current_action.clear();
         } else if route_type == "fail" {
+            let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
             let failed = json!({
                 "ok": false,
                 "status": "failed",
                 "statusMessage": step_result.get("statusMessage").cloned().unwrap_or_else(|| json!("Workflow wurde ueber eine Fehlerroute beendet.")),
                 "steps": step_results,
                 "workflow": context,
+                "browserCleanup": browser_cleanup,
                 "finishedAt": now_iso(),
             });
             fs::write(
@@ -3449,6 +3634,15 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                         object.insert("steps".to_string(), json!(step_results));
                         object.insert("workflow".to_string(), context.clone());
                     }
+                    let browser_cleanup =
+                        close_workflow_browser_for_run(app, job, &steps, &mut context);
+                    if let Some(object) = stopped.as_object_mut() {
+                        object.insert("workflow".to_string(), context.clone());
+                        object.insert(
+                            "browserCleanup".to_string(),
+                            browser_cleanup.unwrap_or(Value::Null),
+                        );
+                    }
                     return Ok(stopped);
                 }
             }
@@ -3484,21 +3678,25 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
     }
 
     if transitions >= max_transitions && !current_action.is_empty() {
+        let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
         return Ok(json!({
             "ok": false,
             "status": "failed",
             "statusMessage": "Zu viele Workflow-Routenwechsel. Moegliche Schleife.",
             "steps": step_results,
             "workflow": context,
+            "browserCleanup": browser_cleanup,
         }));
     }
 
-    Ok(json!({
+    let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
+    let final_result = json!({
         "ok": true,
         "status": "success",
         "statusMessage": "Workflow wurde vollstaendig auf dem ClientController ausgefuehrt.",
         "steps": step_results,
         "workflow": context,
+        "browserCleanup": browser_cleanup,
         "workflow_variables": context.get("workflow_variables").cloned(),
         "workflowVariables": context.get("workflowVariables").cloned(),
         "workflow_return": context.get("workflow_return").cloned(),
@@ -3519,7 +3717,24 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         "browserSessionDeleted": context.get("browserSessionDeleted").cloned(),
         "deletedBrowserSession": context.get("deletedBrowserSession").cloned(),
         "finishedAt": now_iso(),
-    }))
+    });
+    fs::write(
+        run_dir.join("result.json"),
+        serde_json::to_vec_pretty(&final_result)
+            .map_err(|e| format!("serialize final workflow result failed: {e}"))?,
+    )
+    .map_err(|e| format!("write final workflow result failed: {e}"))?;
+    write_full_workflow_snapshot(
+        app,
+        job,
+        "completed",
+        "Workflow wurde vollstaendig auf dem ClientController ausgefuehrt.",
+        None,
+        &step_results,
+        &context,
+    )?;
+
+    Ok(final_result)
 }
 
 fn execute_node_control_job(app: &tauri::AppHandle, job_type: &str) -> Result<Value, String> {
@@ -4479,8 +4694,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        authentication_failed, delivery_ack_from_response, route_type_and_target,
-        workflow_step_route,
+        authentication_failed, chromium_no_sandbox_enabled, delivery_ack_from_response,
+        merge_workflow_context, route_type_and_target, workflow_step_route,
     };
     use serde_json::json;
 
@@ -4515,6 +4730,43 @@ mod tests {
         assert_eq!(control.command, "stop");
         assert_eq!(control.sequence, 2);
         assert_eq!(control.payload["result_status"], "timed_out");
+    }
+
+    #[test]
+    fn chromium_sandbox_is_only_disabled_by_explicit_runtime_configuration() {
+        assert!(!chromium_no_sandbox_enabled(&json!({})));
+        assert!(!chromium_no_sandbox_enabled(
+            &json!({"chromiumNoSandbox": false})
+        ));
+        assert!(chromium_no_sandbox_enabled(
+            &json!({"chromiumNoSandbox": true})
+        ));
+    }
+
+    #[test]
+    fn closed_browser_is_removed_from_workflow_context() {
+        let mut context = json!({
+            "browserWsEndpoint": "ws://127.0.0.1/devtools/browser/test",
+            "browser_ws_endpoint": "ws://127.0.0.1/devtools/browser/test",
+            "browserWindows": [{"key": "main", "targetId": "target-1"}],
+            "browser_windows": [{"key": "main", "targetId": "target-1"}],
+            "workflow_variables": {"kept": true}
+        });
+
+        merge_workflow_context(
+            &mut context,
+            &json!({
+                "closedBrowser": true,
+                "browserWindows": [],
+                "browserWsEndpoint": "ws://stale",
+            }),
+        );
+
+        assert!(context.get("browserWsEndpoint").is_none());
+        assert!(context.get("browser_ws_endpoint").is_none());
+        assert!(context.get("browserWindows").is_none());
+        assert!(context.get("browser_windows").is_none());
+        assert_eq!(context["workflow_variables"]["kept"], true);
     }
 
     #[test]
