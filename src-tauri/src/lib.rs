@@ -614,6 +614,59 @@ fn candidate_adb_paths(app: &tauri::AppHandle) -> Vec<PathBuf> {
     candidates
 }
 
+#[cfg(target_os = "windows")]
+fn stop_bundled_adb_processes(app: &tauri::AppHandle) {
+    let executable_paths = candidate_adb_paths(app)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if executable_paths.is_empty() {
+        return;
+    }
+
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$adbPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$env:FOLLOWFLOW_ADB_PATHS -split "`n" | Where-Object { $_ } | ForEach-Object {
+    [void] $adbPaths.Add([IO.Path]::GetFullPath($_))
+}
+
+Get-CimInstance Win32_Process -Filter "Name = 'adb.exe'" | ForEach-Object {
+    if ($_.ExecutablePath -and $adbPaths.Contains([IO.Path]::GetFullPath($_.ExecutablePath))) {
+        Stop-Process -Id $_.ProcessId -Force
+    }
+}
+"#;
+
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("FOLLOWFLOW_ADB_PATHS", executable_paths)
+        .creation_flags(0x08000000)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "Failed to stop bundled ADB process(es) on exit: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => eprintln!("Failed to run bundled ADB exit cleanup: {error}"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_bundled_adb_processes(app: &tauri::AppHandle) {
+    if let Some(path) = candidate_adb_paths(app)
+        .into_iter()
+        .find(|path| path.is_file())
+    {
+        let _ = Command::new(path).arg("kill-server").output();
+    }
+}
+
 fn resolve_adb(app: &tauri::AppHandle) -> (Option<PathBuf>, String, Vec<String>) {
     stage_bundled_tooling_best_effort(app);
     let candidates = candidate_adb_paths(app);
@@ -4263,7 +4316,7 @@ fn run_full_sync(app: tauri::AppHandle) -> Result<SyncSummary, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -4298,8 +4351,14 @@ pub fn run() {
             run_autopilot_cycle,
             run_full_sync,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            stop_bundled_adb_processes(app_handle);
+        }
+    });
 }
 
 #[cfg(test)]
