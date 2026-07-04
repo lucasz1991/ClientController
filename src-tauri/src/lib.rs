@@ -68,6 +68,7 @@ struct ClientStatus {
     workflow_runtime_path: String,
     app_version: String,
     running_processes: i64,
+    cpu_load_percent: Option<f64>,
     updater_available: bool,
 }
 
@@ -1067,6 +1068,65 @@ fn recover_node_registration(app: &tauri::AppHandle, error: &str) -> Result<bool
     Ok(true)
 }
 
+fn parse_first_number(raw: &str) -> Option<f64> {
+    raw.split(|character: char| {
+        !(character.is_ascii_digit() || character == '.' || character == ',')
+    })
+    .filter(|part| !part.trim().is_empty())
+    .find_map(|part| part.replace(',', ".").parse::<f64>().ok())
+}
+
+fn normalize_cpu_percent(value: f64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+
+    Some((value.clamp(0.0, 100.0) * 100.0).round() / 100.0)
+}
+
+#[cfg(target_os = "windows")]
+fn local_cpu_load_percent() -> Option<f64> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    normalize_cpu_percent(parse_first_number(&raw)?)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_cpu_load_percent() -> Option<f64> {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "ps -A -o %cpu= | awk '{s+=$1} END {print s}'",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let total = parse_first_number(&raw)?;
+    let cpus = std::thread::available_parallelism()
+        .map(|count| count.get().max(1) as f64)
+        .unwrap_or(1.0);
+
+    normalize_cpu_percent(total / cpus)
+}
+
 fn heartbeat_remote_internal(
     app: &tauri::AppHandle,
     status: &str,
@@ -1083,10 +1143,30 @@ fn heartbeat_remote_internal(
         base_url(&cfg.server_domain)
     );
     let workflow_ready = workflow_runtime_ready(app);
+    let mut heartbeat_payload = payload.unwrap_or_else(|| json!({"source": "tauri-client"}));
+
+    if let Some(object) = heartbeat_payload.as_object_mut() {
+        object.insert(
+            "metrics".to_string(),
+            json!({
+                "cpuLoadPercent": local_cpu_load_percent(),
+                "reportedAt": now_iso(),
+            }),
+        );
+    } else {
+        heartbeat_payload = json!({
+            "source": "tauri-client",
+            "value": heartbeat_payload,
+            "metrics": {
+                "cpuLoadPercent": local_cpu_load_percent(),
+                "reportedAt": now_iso(),
+            },
+        });
+    }
 
     let body = json!({
         "status": status,
-        "payload": payload.unwrap_or_else(|| json!({"source": "tauri-client"})),
+        "payload": heartbeat_payload,
         "version": env!("CARGO_PKG_VERSION"),
         "os": std::env::consts::OS,
         "current_server_domain": cfg.server_domain,
@@ -2909,6 +2989,8 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
                     "runId".to_string(),
                     json!(format!("{}-{}", job.job_uuid, transitions)),
                 );
+                runtime_object.insert("workflowBundleStep".to_string(), json!(true));
+                runtime_object.insert("keepWorkflowBrowserAlive".to_string(), json!(false));
 
                 if !start_card.is_empty() {
                     if let Some(tasks) = runtime_object
@@ -3660,6 +3742,7 @@ fn get_client_status(app: tauri::AppHandle) -> Result<ClientStatus, String> {
             .unwrap_or_default(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         running_processes,
+        cpu_load_percent: local_cpu_load_percent(),
         updater_available: false,
     })
 }

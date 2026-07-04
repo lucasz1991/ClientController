@@ -27,6 +27,7 @@ type ClientStatus = {
   workflow_runtime_path: string;
   app_version: string;
   running_processes: number;
+  cpu_load_percent?: number | null;
   updater_available: boolean;
 };
 
