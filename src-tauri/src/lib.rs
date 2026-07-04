@@ -14,7 +14,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tar::{Archive, Builder};
 use tauri::Manager;
 
@@ -2297,6 +2297,7 @@ fn export_workflow_process_debug_internal(
         "workflow-checkpoint.json",
         "workflow-bundle.json",
         "runtime.json",
+        "runner-diagnostics.json",
     ] {
         let source = run_directory.join(name);
         if source.is_file() {
@@ -2326,6 +2327,16 @@ fn export_workflow_process_debug_internal(
             "localProcesses": redact_debug_value(&serde_json::to_value(processes).unwrap_or_else(|_| json!([]))),
         }),
     )?;
+    if let Some(runtime_root) = resolve_workflow_runtime(app) {
+        let runtime_manifest = runtime_root.join("workflow-runtime-manifest.json");
+        if runtime_manifest.is_file() {
+            append_debug_json(
+                &mut archive,
+                "workflow-debug/workflow-runtime-manifest.json",
+                &redact_debug_value(&read_json_file(&runtime_manifest)),
+            )?;
+        }
+    }
     archive
         .finish()
         .map_err(|error| format!("finish workflow debug archive failed: {error}"))?;
@@ -2431,6 +2442,106 @@ fn terminate_child_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn terminate_child_process_only(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn workflow_task_hard_timeout_seconds(runtime: &Value) -> u64 {
+    let tasks_timeout_sum = runtime
+        .get("tasks")
+        .and_then(Value::as_array)
+        .map(|tasks| {
+            tasks
+                .iter()
+                .map(|task| task.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(60))
+                .sum::<u64>()
+        })
+        .unwrap_or(60);
+    let runtime_timeout = runtime
+        .get("timeout_seconds")
+        .or_else(|| runtime.get("timeoutSeconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    tasks_timeout_sum
+        .max(runtime_timeout)
+        .saturating_add(90)
+        .clamp(120, 3600)
+}
+
+fn workflow_task_release_on_result(runtime: &Value) -> bool {
+    matches!(
+        runtime.get("keepWorkflowBrowserAlive"),
+        Some(Value::Bool(false))
+    ) || matches!(
+        runtime.get("keep_workflow_browser_alive"),
+        Some(Value::Bool(false))
+    ) || matches!(
+        runtime.get("workflowBundleStep").and_then(Value::as_bool),
+        Some(true)
+    )
+}
+
+fn workflow_task_finished_result(result_path: &Path) -> Option<Value> {
+    let result = fs::read_to_string(result_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())?;
+
+    if !result.is_object() {
+        return None;
+    }
+
+    let status = result.get("status").and_then(Value::as_str).unwrap_or("");
+
+    if result.get("finishedAt").is_some()
+        || matches!(status, "success" | "failed" | "timed_out" | "timeout" | "cancelled" | "canceled")
+    {
+        return Some(result);
+    }
+
+    None
+}
+
+fn write_workflow_runner_diagnostics(run_dir: &Path, payload: Value) {
+    let _ = fs::write(
+        run_dir.join("runner-diagnostics.json"),
+        serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"{}".to_vec()),
+    );
+}
+
+fn enrich_workflow_task_result(mut result: Value) -> Value {
+    for (path_key, payload_key) in [
+        ("webmailSessionFilePath", "remoteWebmailSessionPayload"),
+        ("browserSessionFilePath", "remoteBrowserSessionPayload"),
+    ] {
+        let session_path = result
+            .get(path_key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                result
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .and_then(|tasks| {
+                        tasks.iter().rev().find_map(|task| {
+                            task.get(path_key).and_then(Value::as_str).map(str::to_string)
+                        })
+                    })
+            });
+
+        if let Some(path) = session_path {
+            if let Ok(payload) = fs::read_to_string(path) {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert(payload_key.to_string(), Value::String(payload));
+                }
+            }
+        }
+    }
+
+    result
+}
+
 fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<Value, String> {
     let runtime_root = resolve_workflow_runtime(app)
         .ok_or_else(|| "workflow runtime not found in application resources".to_string())?;
@@ -2491,6 +2602,9 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         .and_then(Value::as_u64)
         .unwrap_or(3)
         .clamp(1, 60);
+    let release_on_finished_result = workflow_task_release_on_result(&runtime);
+    let hard_timeout_seconds = workflow_task_hard_timeout_seconds(&runtime);
+    let runtime_manifest = read_json_file(&runtime_root.join("workflow-runtime-manifest.json"));
     let initial_status = json!({
         "runId": runtime.get("runId").cloned().unwrap_or_else(|| json!(job.job_uuid)),
         "workflow": runtime.get("workflow").cloned().unwrap_or_else(|| json!({})),
@@ -2504,6 +2618,13 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         "tasks": runtime.get("tasks").cloned().unwrap_or_else(|| json!([])),
         "events": [],
         "browserWindows": [],
+        "runnerDiagnostics": {
+            "releaseOnFinishedResult": release_on_finished_result,
+            "hardTimeoutSeconds": hard_timeout_seconds,
+            "chromiumNoSandboxFlag": cfg!(target_os = "linux"),
+            "chromiumNoSandboxNote": "--no-sandbox erzeugt einen Chromium-Warnhinweis, ist aber nicht automatisch ein Steuerungsfehler.",
+            "runtimeManifest": runtime_manifest.clone(),
+        },
         "at": now_iso(),
     });
     fs::write(
@@ -2550,6 +2671,8 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|e| format!("start workflow task process failed: {e}"))?;
+    let child_pid = child.id();
+    let child_started_at = Instant::now();
     let output_status = loop {
         match child
             .try_wait()
@@ -2571,6 +2694,113 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
                     terminate_child_tree(&mut child);
                     return Ok(stopped);
                 }
+
+                if release_on_finished_result {
+                    if let Some(mut result) = workflow_task_finished_result(&result_path) {
+                        if let Some(object) = result.as_object_mut() {
+                            object.insert("clientControllerRunnerReleased".to_string(), json!(true));
+                            object.insert("clientControllerRunnerReleaseReason".to_string(), json!("result-written-before-node-exit"));
+                            object.insert("clientControllerRunnerProcessId".to_string(), json!(child_pid));
+                            object.insert(
+                                "clientControllerRunnerElapsedSeconds".to_string(),
+                                json!(child_started_at.elapsed().as_secs()),
+                            );
+                        }
+                        write_workflow_runner_diagnostics(
+                            &run_dir,
+                            json!({
+                                "stage": "result-written-before-node-exit",
+                                "message": "Der Node-Runner hat ein Ergebnis geschrieben, lief aber weiter. Tauri gibt den Workflow-Schritt frei und beendet nur den Runner-Prozess.",
+                                "jobUuid": job.job_uuid,
+                                "runId": runtime.get("runId").cloned(),
+                                "childProcessId": child_pid,
+                                "elapsedSeconds": child_started_at.elapsed().as_secs(),
+                                "releaseOnFinishedResult": release_on_finished_result,
+                                "hardTimeoutSeconds": hard_timeout_seconds,
+                                "runtimeManifest": runtime_manifest.clone(),
+                                "status": read_json_file(&status_path),
+                                "result": result.clone(),
+                            }),
+                        );
+                        let _ = queue_local_event(
+                            app,
+                            "workflow_task_runner_released",
+                            json!({
+                                "job_uuid": job.job_uuid,
+                                "pid": child_pid,
+                                "elapsed_seconds": child_started_at.elapsed().as_secs(),
+                            }),
+                        );
+                        let _ = queue_job_progress_delivery(
+                            app,
+                            job,
+                            &status_path,
+                            &preview_path,
+                            live_preview_enabled,
+                        );
+                        let _ = flush_job_delivery_outbox(app, 10);
+                        terminate_child_process_only(&mut child);
+
+                        return Ok(enrich_workflow_task_result(result));
+                    }
+                }
+
+                if child_started_at.elapsed().as_secs() >= hard_timeout_seconds {
+                    let timeout_result = json!({
+                        "ok": false,
+                        "status": "timed_out",
+                        "state": "timed_out",
+                        "statusMessage": format!("ClientController-Runner hat nach {} Sekunden kein Ergebnis geliefert.", hard_timeout_seconds),
+                        "clientControllerRunnerHardTimeout": true,
+                        "clientControllerRunnerProcessId": child_pid,
+                        "clientControllerRunnerElapsedSeconds": child_started_at.elapsed().as_secs(),
+                        "finishedAt": now_iso(),
+                    });
+                    fs::write(
+                        &status_path,
+                        serde_json::to_vec_pretty(&json!({
+                            "runId": runtime.get("runId").cloned().unwrap_or_else(|| json!(job.job_uuid)),
+                            "state": "timed_out",
+                            "stage": "client-runner-hard-timeout",
+                            "message": timeout_result.get("statusMessage").cloned().unwrap_or_else(|| json!("ClientController-Runner Timeout.")),
+                            "statusMessage": timeout_result.get("statusMessage").cloned().unwrap_or_else(|| json!("ClientController-Runner Timeout.")),
+                            "isRunning": false,
+                            "result": timeout_result.clone(),
+                            "at": now_iso(),
+                        }))
+                        .map_err(|e| format!("serialize runner timeout status failed: {e}"))?,
+                    )
+                    .map_err(|e| format!("write runner timeout status failed: {e}"))?;
+                    write_workflow_runner_diagnostics(
+                        &run_dir,
+                        json!({
+                            "stage": "client-runner-hard-timeout",
+                            "message": "Der Node-Runner hat kein result.json innerhalb des lokalen Sicherheits-Timeouts geschrieben.",
+                            "jobUuid": job.job_uuid,
+                            "runId": runtime.get("runId").cloned(),
+                            "childProcessId": child_pid,
+                            "elapsedSeconds": child_started_at.elapsed().as_secs(),
+                            "hardTimeoutSeconds": hard_timeout_seconds,
+                            "releaseOnFinishedResult": release_on_finished_result,
+                            "runtimeManifest": runtime_manifest.clone(),
+                            "status": read_json_file(&status_path),
+                            "stdoutTail": read_file_tail(&stdout_path, 16_000),
+                            "stderrTail": read_file_tail(&stderr_path, 16_000),
+                        }),
+                    );
+                    let _ = queue_job_progress_delivery(
+                        app,
+                        job,
+                        &status_path,
+                        &preview_path,
+                        live_preview_enabled,
+                    );
+                    let _ = flush_job_delivery_outbox(app, 10);
+                    terminate_child_tree(&mut child);
+
+                    return Ok(timeout_result);
+                }
+
                 std::thread::sleep(Duration::from_secs(progress_interval_seconds));
             }
         }
@@ -2591,38 +2821,8 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
 
-    if let Some(mut result) = result {
-        for (path_key, payload_key) in [
-            ("webmailSessionFilePath", "remoteWebmailSessionPayload"),
-            ("browserSessionFilePath", "remoteBrowserSessionPayload"),
-        ] {
-            let session_path = result
-                .get(path_key)
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    result
-                        .get("tasks")
-                        .and_then(Value::as_array)
-                        .and_then(|tasks| {
-                            tasks.iter().rev().find_map(|task| {
-                                task.get(path_key)
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                        })
-                });
-
-            if let Some(path) = session_path {
-                if let Ok(payload) = fs::read_to_string(path) {
-                    if let Some(object) = result.as_object_mut() {
-                        object.insert(payload_key.to_string(), Value::String(payload));
-                    }
-                }
-            }
-        }
-
-        return Ok(result);
+    if let Some(result) = result {
+        return Ok(enrich_workflow_task_result(result));
     }
 
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
