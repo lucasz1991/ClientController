@@ -3145,6 +3145,33 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         }
     }
 
+    let mut workflow_variables = serde_json::Map::new();
+    for key in ["workflow_variables", "workflowVariables"] {
+        if let Some(existing) = target.get(key).and_then(Value::as_object) {
+            for (name, value) in existing {
+                workflow_variables.insert(name.clone(), value.clone());
+            }
+        }
+    }
+
+    let mut workflow_variables_changed = false;
+    for key in ["workflow_variables", "workflowVariables"] {
+        if let Some(next) = result.get(key).and_then(Value::as_object) {
+            workflow_variables_changed = true;
+            for (name, value) in next {
+                if !value.is_null() {
+                    workflow_variables.insert(name.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    if workflow_variables_changed {
+        let merged = Value::Object(workflow_variables);
+        target.insert("workflow_variables".to_string(), merged.clone());
+        target.insert("workflowVariables".to_string(), merged);
+    }
+
     for key in [
         "account",
         "new_password",
@@ -3155,8 +3182,6 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         "workflow_return",
         "workflowReturn",
         "workflow_return_ok",
-        "workflow_variables",
-        "workflowVariables",
         "browserWindows",
         "browserWsEndpoint",
         "browserOwnerProcessId",
@@ -4993,6 +5018,28 @@ mod tests {
         assert!(context.get("browserOwnerProcessId").is_none());
         assert!(context.get("browserOwnerRunId").is_none());
         assert_eq!(context["workflow_variables"]["kept"], true);
+    }
+
+    #[test]
+    fn workflow_variables_are_merged_between_bundle_steps() {
+        let mut context = json!({
+            "workflow_variables": {"kept": true},
+            "workflowVariables": {"camel_kept": true}
+        });
+
+        merge_workflow_context(
+            &mut context,
+            &json!({
+                "workflow_variables": {"verification_code": "123456"},
+                "workflowVariables": {"workflow_return": "123456"}
+            }),
+        );
+
+        assert_eq!(context["workflow_variables"]["kept"], true);
+        assert_eq!(context["workflow_variables"]["camel_kept"], true);
+        assert_eq!(context["workflow_variables"]["verification_code"], "123456");
+        assert_eq!(context["workflow_variables"]["workflow_return"], "123456");
+        assert_eq!(context["workflowVariables"], context["workflow_variables"]);
     }
 
     #[test]
