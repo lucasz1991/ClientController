@@ -2254,6 +2254,21 @@ fn workflow_job_directory(app: &tauri::AppHandle, job_uuid: &str) -> Result<Path
         .join(validated_job_uuid(job_uuid)?))
 }
 
+fn browser_profile_key(runtime: &Value) -> Option<&str> {
+    let key = runtime.get("browserProfileKey")?.as_str()?.trim();
+
+    if key.is_empty()
+        || key.len() > 120
+        || !key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return None;
+    }
+
+    Some(key)
+}
+
 fn read_json_file(path: &Path) -> Value {
     fs::read_to_string(path)
         .ok()
@@ -2743,7 +2758,14 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     let _ = fs::remove_file(&result_path);
     let config_path = run_dir.join("runtime.json");
     let preview_path = run_dir.join("live.png");
-    let browser_profile_path = run_dir.join("browser-profile");
+    let browser_profile_path = match browser_profile_key(&runtime) {
+        Some(profile_key) => ensure_runtime_dir(app)?
+            .join("browser-profiles")
+            .join(profile_key),
+        None => run_dir.join("browser-profile"),
+    };
+    fs::create_dir_all(&browser_profile_path)
+        .map_err(|e| format!("create browser profile directory failed: {e}"))?;
     let runtime_object = runtime
         .as_object_mut()
         .ok_or_else(|| "workflow runtime is not an object".to_string())?;
@@ -4879,9 +4901,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        authentication_failed, chromium_no_sandbox_enabled, configure_workflow_bundle_step_runtime,
-        delivery_ack_from_response, merge_workflow_context, route_type_and_target,
-        workflow_result_owns_browser, workflow_step_route, workflow_task_release_on_result,
+        authentication_failed, browser_profile_key, chromium_no_sandbox_enabled,
+        configure_workflow_bundle_step_runtime, delivery_ack_from_response, merge_workflow_context,
+        route_type_and_target, workflow_result_owns_browser, workflow_step_route,
+        workflow_task_release_on_result,
     };
     use serde_json::json;
 
@@ -4927,6 +4950,18 @@ mod tests {
         assert!(chromium_no_sandbox_enabled(
             &json!({"chromiumNoSandbox": true})
         ));
+    }
+
+    #[test]
+    fn browser_profile_key_only_accepts_safe_stable_segments() {
+        assert_eq!(
+            browser_profile_key(&json!({"browserProfileKey": "mailbox-0123456789abcdef"})),
+            Some("mailbox-0123456789abcdef")
+        );
+        assert_eq!(
+            browser_profile_key(&json!({"browserProfileKey": "../outside"})),
+            None
+        );
     }
 
     #[test]
