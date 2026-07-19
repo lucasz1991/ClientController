@@ -3341,24 +3341,39 @@ fn close_workflow_browser_for_run(
 }
 
 fn workflow_step_route(step: &Value, result: &Value, outcome: &str) -> Value {
-    if result
+    let route_requested = result
         .get("routeRequested")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let completed_key = result
-            .get("completedTaskKey")
+        .unwrap_or(false);
+    let task_key = if outcome == "success" {
+        route_requested
+            .then(|| {
+                result
+                    .get("completedTaskKey")
+                    .or_else(|| result.get("completed_task_key"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            })
+            .unwrap_or("")
+    } else {
+        result
+            .get("failedTaskKey")
+            .or_else(|| result.get("failed_task_key"))
+            .or_else(|| result.get("completedTaskKey"))
             .or_else(|| result.get("completed_task_key"))
             .and_then(Value::as_str)
-            .unwrap_or("");
+            .unwrap_or("")
+    };
+
+    if !task_key.is_empty() {
         if let Some(task) = step
             .get("runtime")
             .and_then(|runtime| runtime.get("tasks"))
             .and_then(Value::as_array)
             .and_then(|tasks| {
-                tasks.iter().find(|task| {
-                    task.get("key").and_then(Value::as_str).unwrap_or("") == completed_key
-                })
+                tasks
+                    .iter()
+                    .find(|task| task.get("key").and_then(Value::as_str).unwrap_or("") == task_key)
             })
         {
             let route = if outcome == "success" {
@@ -3371,6 +3386,10 @@ fn workflow_step_route(step: &Value, result: &Value, outcome: &str) -> Value {
             };
             if let Some(route) = route.filter(|route| route.is_object()) {
                 return route.clone();
+            }
+
+            if outcome != "success" {
+                return json!({"type": "fail"});
             }
         }
     }
@@ -3428,6 +3447,10 @@ fn route_type_and_target(route: &Value, current_action: &str) -> (String, String
         target
     };
     (route_type, target, card)
+}
+
+fn route_terminates_workflow_as_failure(route_type: &str, _outcome: &str) -> bool {
+    route_type == "fail"
 }
 
 fn write_full_workflow_snapshot(
@@ -3777,9 +3800,7 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         let route = workflow_step_route(step, &step_result, outcome);
         let (route_type, target, card) = route_type_and_target(&route, &current_action);
 
-        if route_type == "end" {
-            current_action.clear();
-        } else if route_type == "fail" {
+        if route_terminates_workflow_as_failure(&route_type, outcome) {
             let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
             let failed = json!({
                 "ok": false,
@@ -3797,6 +3818,8 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
             )
             .map_err(|e| format!("write failed workflow checkpoint failed: {e}"))?;
             return Ok(failed);
+        } else if route_type == "end" {
+            current_action.clear();
         } else {
             current_action = if target == "next" {
                 step.get("defaultNext")
@@ -4903,8 +4926,8 @@ mod tests {
     use super::{
         authentication_failed, browser_profile_key, chromium_no_sandbox_enabled,
         configure_workflow_bundle_step_runtime, delivery_ack_from_response, merge_workflow_context,
-        route_type_and_target, workflow_result_owns_browser, workflow_step_route,
-        workflow_task_release_on_result,
+        route_terminates_workflow_as_failure, route_type_and_target, workflow_result_owns_browser,
+        workflow_step_route, workflow_task_release_on_result,
     };
     use serde_json::json;
 
@@ -5109,5 +5132,69 @@ mod tests {
             route_type_and_target(&linear_route, "first"),
             ("step".to_string(), "second".to_string(), "".to_string())
         );
+    }
+
+    #[test]
+    fn failed_task_uses_its_error_branch_even_without_route_requested() {
+        let step = json!({
+            "actionKey": "first",
+            "defaultNext": "second",
+            "routes": {
+                "failed": {"type": "step", "action_key": "legacy-step-fallback"}
+            },
+            "runtime": {
+                "tasks": [{
+                    "key": "branch",
+                    "on_error": {"type": "step", "action_key": "alternative-list"}
+                }]
+            }
+        });
+        let route = workflow_step_route(
+            &step,
+            &json!({"ok": false, "failedTaskKey": "branch"}),
+            "failed",
+        );
+
+        assert_eq!(
+            route_type_and_target(&route, "first"),
+            (
+                "step".to_string(),
+                "alternative-list".to_string(),
+                "".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn missing_task_error_route_is_terminal_and_does_not_use_a_step_fallback() {
+        let step = json!({
+            "actionKey": "first",
+            "routes": {
+                "failed": {"type": "step", "action_key": "legacy-step-fallback"}
+            },
+            "runtime": {
+                "tasks": [{"key": "branch"}]
+            }
+        });
+        let route = workflow_step_route(
+            &step,
+            &json!({"ok": false, "failedTaskKey": "branch"}),
+            "failed",
+        );
+
+        assert_eq!(
+            route_type_and_target(&route, "first"),
+            ("fail".to_string(), "".to_string(), "".to_string())
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_fail_route_terminates_as_failure() {
+        assert!(!route_terminates_workflow_as_failure("end", "success"));
+        assert!(!route_terminates_workflow_as_failure("end", "failed"));
+        assert!(!route_terminates_workflow_as_failure("end", "timeout"));
+        assert!(route_terminates_workflow_as_failure("fail", "success"));
+        assert!(!route_terminates_workflow_as_failure("step", "failed"));
+        assert!(!route_terminates_workflow_as_failure("card", "failed"));
     }
 }
