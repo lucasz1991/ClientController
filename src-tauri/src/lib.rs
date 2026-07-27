@@ -1583,6 +1583,156 @@ fn resolve_workflow_runtime(app: &tauri::AppHandle) -> Option<PathBuf> {
     })
 }
 
+fn canonical_workflow_runtime_contents(contents: &[u8]) -> Vec<u8> {
+    let contents = contents
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(contents);
+    let mut canonical = Vec::with_capacity(contents.len());
+    let mut index = 0;
+
+    while index < contents.len() {
+        if contents[index] == b'\r' {
+            canonical.push(b'\n');
+            if contents.get(index + 1) == Some(&b'\n') {
+                index += 1;
+            }
+        } else {
+            canonical.push(contents[index]);
+        }
+
+        index += 1;
+    }
+
+    canonical
+}
+
+fn collect_workflow_runtime_hashes(
+    runtime_root: &Path,
+    directory: &Path,
+    hashes: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "read workflow runtime directory {} failed: {error}",
+            directory.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "read workflow runtime entry under {} failed: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "read workflow runtime file type {} failed: {error}",
+                path.display()
+            )
+        })?;
+
+        if file_type.is_dir() {
+            collect_workflow_runtime_hashes(runtime_root, &path, hashes)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if !file_name.ends_with(".cjs") || file_name.ends_with(".test.cjs") {
+            continue;
+        }
+
+        let relative_path = path
+            .strip_prefix(runtime_root)
+            .map_err(|error| {
+                format!(
+                    "resolve workflow runtime path {} failed: {error}",
+                    path.display()
+                )
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = fs::read(&path).map_err(|error| {
+            format!(
+                "read workflow runtime file {} failed: {error}",
+                path.display()
+            )
+        })?;
+        let file_hash = hex::encode(Sha256::digest(canonical_workflow_runtime_contents(
+            &contents,
+        )));
+        hashes.push((relative_path, file_hash));
+    }
+
+    Ok(())
+}
+
+fn workflow_runtime_fingerprint(runtime_root: &Path) -> Result<String, String> {
+    let mut hashes = Vec::new();
+
+    for relative_directory in ["node/workflows", "resources/node/register/lib"] {
+        let directory = runtime_root.join(relative_directory);
+        if !directory.is_dir() {
+            return Err(format!(
+                "workflow runtime directory was not found: {}",
+                directory.display()
+            ));
+        }
+
+        collect_workflow_runtime_hashes(runtime_root, &directory, &mut hashes)?;
+    }
+
+    hashes.sort_by(|left, right| left.0.cmp(&right.0));
+    let manifest = hashes
+        .iter()
+        .map(|(path, hash)| format!("{path}:{hash}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(hex::encode(Sha256::digest(manifest.as_bytes())))
+}
+
+fn verify_workflow_bundle_runtime(runtime_root: &Path, bundle: &Value) -> Result<(), String> {
+    let Some(expected_hash) = bundle
+        .get("runtimeHash")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+    else {
+        // Alte Server-Bundles ohne Fingerabdruck bleiben waehrend des rollierenden
+        // Updates kompatibel. Neue Bundles werden vor dem ersten Step strikt geprueft.
+        return Ok(());
+    };
+    let algorithm = bundle
+        .get("runtimeHashAlgorithm")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|algorithm| !algorithm.is_empty())
+        .unwrap_or("sha256");
+    if !algorithm.eq_ignore_ascii_case("sha256") {
+        return Err(format!(
+            "workflow_runtime_hash_algorithm_unsupported: expected sha256, received {algorithm}"
+        ));
+    }
+
+    let actual_hash = workflow_runtime_fingerprint(runtime_root)?;
+    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+        return Err(format!(
+            "workflow_runtime_mismatch: bundle requires {expected_hash}, client provides {actual_hash}; synchronize the ClientController workflow runtime"
+        ));
+    }
+
+    Ok(())
+}
+
 fn ensure_workflow_dependencies(
     app: &tauri::AppHandle,
     runtime_root: &Path,
@@ -1657,23 +1807,87 @@ fn executable_workflow_runtime(
         return Ok(resource_runtime_root.to_path_buf());
     }
 
-    let staged_runtime_root = modules_root
+    stage_executable_workflow_runtime(resource_runtime_root, &modules_root)
+}
+
+fn stage_executable_workflow_runtime(
+    resource_runtime_root: &Path,
+    modules_root: &Path,
+) -> Result<PathBuf, String> {
+    let expected_hash = workflow_runtime_fingerprint(resource_runtime_root)?;
+    let dependencies_root = modules_root
         .parent()
-        .ok_or_else(|| "portable workflow dependency root has no parent directory".to_string())?
-        .to_path_buf();
+        .ok_or_else(|| "portable workflow dependency root has no parent directory".to_string())?;
+    let staged_runtimes_root = dependencies_root.join("workflow-runtimes");
+    fs::create_dir_all(&staged_runtimes_root)
+        .map_err(|e| format!("create staged workflow runtime root failed: {e}"))?;
+    let staged_runtime_root = staged_runtimes_root.join(&expected_hash);
+
+    if staged_runtime_root.is_dir() {
+        let staged_hash = workflow_runtime_fingerprint(&staged_runtime_root)?;
+        if staged_hash.eq_ignore_ascii_case(&expected_hash) {
+            return Ok(staged_runtime_root);
+        }
+
+        return Err(format!(
+            "workflow_runtime_stage_corrupt: staged runtime {} does not match its content hash",
+            staged_runtime_root.display()
+        ));
+    }
+
+    let temporary_runtime_root = staged_runtimes_root.join(format!(
+        ".{expected_hash}-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    if temporary_runtime_root.exists() {
+        return Err(format!(
+            "temporary workflow runtime stage already exists: {}",
+            temporary_runtime_root.display()
+        ));
+    }
 
     for directory in ["node", "resources"] {
         copy_dir_recursive(
             &resource_runtime_root.join(directory),
-            &staged_runtime_root.join(directory),
+            &temporary_runtime_root.join(directory),
         )?;
     }
 
     fs::copy(
         resource_runtime_root.join("package.json"),
-        staged_runtime_root.join("package.json"),
+        temporary_runtime_root.join("package.json"),
     )
     .map_err(|e| format!("stage portable workflow package manifest failed: {e}"))?;
+
+    let staged_hash = workflow_runtime_fingerprint(&temporary_runtime_root)?;
+    if !staged_hash.eq_ignore_ascii_case(&expected_hash) {
+        return Err(format!(
+            "workflow_runtime_stage_mismatch: resource runtime {expected_hash}, staged runtime {staged_hash}"
+        ));
+    }
+
+    match fs::rename(&temporary_runtime_root, &staged_runtime_root) {
+        Ok(()) => {}
+        Err(error) if staged_runtime_root.is_dir() => {
+            fs::remove_dir_all(&temporary_runtime_root).map_err(|cleanup_error| {
+                format!(
+                    "cleanup concurrent workflow runtime stage after {error} failed: {cleanup_error}"
+                )
+            })?;
+            let concurrent_hash = workflow_runtime_fingerprint(&staged_runtime_root)?;
+            if !concurrent_hash.eq_ignore_ascii_case(&expected_hash) {
+                return Err(format!(
+                    "workflow_runtime_stage_corrupt: concurrent stage {} does not match {expected_hash}",
+                    staged_runtime_root.display()
+                ));
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary_runtime_root);
+            return Err(format!("activate staged workflow runtime failed: {error}"));
+        }
+    }
 
     Ok(staged_runtime_root)
 }
@@ -2740,13 +2954,15 @@ fn execute_workflow_task_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<
     let browser_binary = bundled_cloakbrowser_binary(&runtime_root).ok_or_else(|| {
         "bundled CloakBrowser binary is missing from ClientController resources".to_string()
     })?;
-    let execution_runtime_root = executable_workflow_runtime(app, &runtime_root)?;
     let mut runtime = job
         .payload
         .get("runtime")
         .cloned()
         .filter(Value::is_object)
         .ok_or_else(|| "workflow_task payload.runtime is missing".to_string())?;
+    verify_workflow_bundle_runtime(&runtime_root, &runtime)?;
+    let execution_runtime_root = executable_workflow_runtime(app, &runtime_root)?;
+    verify_workflow_bundle_runtime(&execution_runtime_root, &runtime)?;
     let run_dir = ensure_runtime_dir(app)?
         .join("workflow-jobs")
         .join(&job.job_uuid);
@@ -3212,6 +3428,20 @@ fn merge_workflow_context(context: &mut Value, result: &Value) {
         "remoteWebmailSessionPayload",
         "browserSessionFilePath",
         "remoteBrowserSessionPayload",
+        "browserSessionPayloadHash",
+        "browserSessionSummary",
+        "sessionKey",
+        "sessionLabel",
+        "domain",
+        "domains",
+        "cookieDomains",
+        "cookieCount",
+        "finalUrl",
+        "scriptName",
+        "scriptVersion",
+        "automaticBrowserSession",
+        "browserSessionAutoLoaded",
+        "browser_session_auto_loaded",
         "browserSessionDeleted",
         "deletedBrowserSession",
     ] {
@@ -3517,6 +3747,9 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         .cloned()
         .filter(Value::is_object)
         .ok_or_else(|| "workflow_run payload.workflow_bundle is missing".to_string())?;
+    let runtime_root = resolve_workflow_runtime(app)
+        .ok_or_else(|| "workflow runtime is not available on this client".to_string())?;
+    verify_workflow_bundle_runtime(&runtime_root, &bundle)?;
     let steps = bundle
         .get("steps")
         .and_then(Value::as_array)
@@ -3917,7 +4150,7 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
     }
 
     let browser_cleanup = close_workflow_browser_for_run(app, job, &steps, &mut context);
-    let final_result = json!({
+    let mut final_result = json!({
         "ok": true,
         "status": "success",
         "statusMessage": "Workflow wurde vollstaendig auf dem ClientController ausgefuehrt.",
@@ -3948,6 +4181,28 @@ fn execute_workflow_run_job(app: &tauri::AppHandle, job: &RemoteJob) -> Result<V
         "deletedBrowserSession": context.get("deletedBrowserSession").cloned(),
         "finishedAt": now_iso(),
     });
+    if let Some(object) = final_result.as_object_mut() {
+        for key in [
+            "browserSessionPayloadHash",
+            "browserSessionSummary",
+            "sessionKey",
+            "sessionLabel",
+            "domain",
+            "domains",
+            "cookieDomains",
+            "cookieCount",
+            "finalUrl",
+            "scriptName",
+            "scriptVersion",
+            "automaticBrowserSession",
+            "browserSessionAutoLoaded",
+            "browser_session_auto_loaded",
+        ] {
+            if let Some(value) = context.get(key).filter(|value| !value.is_null()) {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
     fs::write(
         run_dir.join("result.json"),
         serde_json::to_vec_pretty(&final_result)
@@ -4926,10 +5181,48 @@ mod tests {
     use super::{
         authentication_failed, browser_profile_key, chromium_no_sandbox_enabled,
         configure_workflow_bundle_step_runtime, delivery_ack_from_response, merge_workflow_context,
-        route_terminates_workflow_as_failure, route_type_and_target, workflow_result_owns_browser,
-        workflow_step_route, workflow_task_release_on_result,
+        route_terminates_workflow_as_failure, route_type_and_target,
+        stage_executable_workflow_runtime, verify_workflow_bundle_runtime,
+        workflow_result_owns_browser, workflow_runtime_fingerprint, workflow_step_route,
+        workflow_task_release_on_result,
     };
     use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TemporaryRuntime {
+        root: PathBuf,
+    }
+
+    impl TemporaryRuntime {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "client-controller-workflow-runtime-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(root.join("node/workflows/nested"))
+                .expect("temporary workflow runtime should be created");
+            fs::create_dir_all(root.join("resources/node/register/lib"))
+                .expect("temporary launcher runtime should be created");
+
+            Self { root }
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for TemporaryRuntime {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn detects_node_authentication_failures() {
@@ -5015,6 +5308,154 @@ mod tests {
                 "browserIdentity": {"connectedToExistingBrowser": true}
             })
         ));
+    }
+
+    #[test]
+    fn workflow_runtime_fingerprint_matches_the_server_canonicalization() {
+        let runtime = TemporaryRuntime::new();
+        fs::write(
+            runtime.path().join("node/workflows/a.cjs"),
+            b"\xef\xbb\xbfalpha\r\n",
+        )
+        .expect("first runtime fixture should be written");
+        fs::write(
+            runtime.path().join("node/workflows/nested/b.cjs"),
+            b"beta\r",
+        )
+        .expect("nested runtime fixture should be written");
+        fs::write(
+            runtime.path().join("node/workflows/ignored.test.cjs"),
+            b"must not influence the runtime hash",
+        )
+        .expect("test runtime fixture should be written");
+        fs::write(
+            runtime.path().join("node/workflows/ignored.json"),
+            b"must not influence the runtime hash",
+        )
+        .expect("non-cjs runtime fixture should be written");
+        fs::write(
+            runtime
+                .path()
+                .join("resources/node/register/lib/browser-launcher.cjs"),
+            b"launcher\r\n",
+        )
+        .expect("browser launcher fixture should be written");
+
+        let fingerprint = workflow_runtime_fingerprint(runtime.path())
+            .expect("workflow runtime fingerprint should be computed");
+
+        assert_eq!(
+            fingerprint,
+            "6a3f60252291b144f57e4674d670be6d081f9a994fc201030f547885816c0884"
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_fingerprint_detects_browser_launcher_drift() {
+        let runtime = TemporaryRuntime::new();
+        fs::write(
+            runtime.path().join("node/workflows/run_step.cjs"),
+            b"runner\n",
+        )
+        .expect("runner fixture should be written");
+        let launcher = runtime
+            .path()
+            .join("resources/node/register/lib/browser-launcher.cjs");
+        fs::write(&launcher, b"launcher-v1\n").expect("launcher fixture should be written");
+        let before = workflow_runtime_fingerprint(runtime.path()).expect("first hash should work");
+
+        fs::write(&launcher, b"launcher-v2\n").expect("launcher fixture should change");
+        let after = workflow_runtime_fingerprint(runtime.path()).expect("second hash should work");
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn staged_workflow_runtime_is_content_addressed_and_drops_removed_scripts() {
+        let runtime = TemporaryRuntime::new();
+        fs::write(
+            runtime.path().join("node/workflows/run_step.cjs"),
+            b"runner-v1\n",
+        )
+        .expect("runner fixture should be written");
+        fs::write(
+            runtime.path().join("node/workflows/removed.cjs"),
+            b"legacy\n",
+        )
+        .expect("legacy fixture should be written");
+        fs::write(
+            runtime
+                .path()
+                .join("resources/node/register/lib/browser-launcher.cjs"),
+            b"launcher\n",
+        )
+        .expect("launcher fixture should be written");
+        fs::write(runtime.path().join("package.json"), b"{}\n")
+            .expect("package fixture should be written");
+        let modules_root = runtime.path().join("dependencies/node_modules");
+        fs::create_dir_all(&modules_root).expect("modules fixture should be created");
+
+        let first = stage_executable_workflow_runtime(runtime.path(), &modules_root)
+            .expect("first stage should work");
+        assert!(first.join("node/workflows/removed.cjs").is_file());
+
+        fs::remove_file(runtime.path().join("node/workflows/removed.cjs"))
+            .expect("legacy source fixture should be removed");
+        fs::write(
+            runtime.path().join("node/workflows/run_step.cjs"),
+            b"runner-v2\n",
+        )
+        .expect("runner fixture should change");
+        let second = stage_executable_workflow_runtime(runtime.path(), &modules_root)
+            .expect("second stage should work");
+
+        assert_ne!(first, second);
+        assert!(!second.join("node/workflows/removed.cjs").exists());
+        assert_eq!(
+            workflow_runtime_fingerprint(&second).expect("staged hash should work"),
+            workflow_runtime_fingerprint(runtime.path()).expect("resource hash should work")
+        );
+    }
+
+    #[test]
+    fn workflow_bundle_runtime_hash_is_enforced_before_execution() {
+        let runtime = TemporaryRuntime::new();
+        fs::write(
+            runtime.path().join("node/workflows/run_step.cjs"),
+            b"module.exports = {};\n",
+        )
+        .expect("runtime fixture should be written");
+        let local_hash = workflow_runtime_fingerprint(runtime.path())
+            .expect("workflow runtime fingerprint should be computed");
+
+        verify_workflow_bundle_runtime(
+            runtime.path(),
+            &json!({
+                "runtimeHash": local_hash.to_uppercase(),
+                "runtimeHashAlgorithm": "SHA256"
+            }),
+        )
+        .expect("matching runtime hash should be accepted");
+
+        let mismatch = verify_workflow_bundle_runtime(
+            runtime.path(),
+            &json!({
+                "runtimeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "runtimeHashAlgorithm": "sha256"
+            }),
+        )
+        .expect_err("mismatching runtime hash should be rejected");
+        assert!(mismatch.starts_with("workflow_runtime_mismatch:"));
+
+        let unsupported = verify_workflow_bundle_runtime(
+            runtime.path(),
+            &json!({"runtimeHash": local_hash, "runtimeHashAlgorithm": "sha512"}),
+        )
+        .expect_err("unsupported runtime hash algorithm should be rejected");
+        assert!(unsupported.starts_with("workflow_runtime_hash_algorithm_unsupported:"));
+
+        verify_workflow_bundle_runtime(runtime.path(), &json!({}))
+            .expect("legacy bundle without runtime hash should remain compatible");
     }
 
     #[test]
