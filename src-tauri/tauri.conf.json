@@ -18,7 +18,34 @@
                                 }
                             ],
                 "security":  {
-                                 "csp":  null
+                                 "csp":  {
+                                             "default-src":  "'self'",
+                                             "connect-src":  "ipc: http://ipc.localhost",
+                                             "font-src":  "'self'",
+                                             "img-src":  "'self' data: blob:",
+                                             "style-src":  "'self' 'unsafe-inline'",
+                                             "script-src":  "'self'",
+                                             "object-src":  "'none'",
+                                             "base-uri":  "'none'",
+                                             "frame-ancestors":  "'none'",
+                                             "form-action":  "'none'"
+                                         },
+                                 "devCsp":  {
+                                                "default-src":  "'self' http://localhost:1420",
+                                                "connect-src":  "ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420",
+                                                "font-src":  "'self'",
+                                                "img-src":  "'self' data: blob:",
+                                                "style-src":  "'self' 'unsafe-inline'",
+                                                "script-src":  "'self' http://localhost:1420",
+                                                "object-src":  "'none'",
+                                                "base-uri":  "'none'",
+                                                "frame-ancestors":  "'none'",
+                                                "form-action":  "'none'"
+                                            },
+                                 "headers":  {
+                                                 "X-Content-Type-Options":  "nosniff",
+                                                 "Permissions-Policy":  "camera=(), microphone=(), geolocation=()"
+                                             }
                              }
             },
     "plugins":  {},

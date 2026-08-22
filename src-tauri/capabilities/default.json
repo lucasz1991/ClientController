@@ -4,7 +4,22 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "opener:default"
+    "allow-bootstrap-local-runtime",
+    "allow-get-client-status",
+    "allow-get-local-processes",
+    "allow-get-workflow-process-preview",
+    "allow-export-workflow-process-debug",
+    "allow-update-server-domain",
+    "allow-update-adb-settings",
+    "allow-configure-bootstrap-credential",
+    "allow-queue-event-local",
+    "allow-get-pending-events",
+    "allow-mark-event-sent",
+    "allow-register-node-remote",
+    "allow-send-heartbeat-remote",
+    "allow-discover-android-devices",
+    "allow-get-local-devices",
+    "allow-sync-devices-remote",
+    "allow-run-autopilot-cycle"
   ]
 }

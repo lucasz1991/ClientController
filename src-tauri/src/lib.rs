@@ -1,8 +1,24 @@
+mod config;
+mod credentials;
+mod jobs;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
+use config::{
+    adb_device_discovery_enabled, adb_enabled, base_url, config_path, load_or_create_config,
+    save_config, validated_server_domain, ClientConfig,
+};
+use credentials::{delete as delete_secret, store as store_secret, ClientSecret};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use hmac::{Hmac, Mac};
-use reqwest::blocking::Client;
+use jobs::doorbell::{
+    channel as create_job_poll_doorbell, JobPollDoorbell,
+    WATCHDOG_INTERVAL as AUTOPILOT_WATCHDOG_INTERVAL,
+};
+use jobs::realtime::{
+    listen_once as listen_realtime_once, reconnect_delay, RealtimeCredentials, SessionOutcome,
+};
+use reqwest::{blocking::Client, header::HeaderValue, redirect::Policy as RedirectPolicy};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,53 +30,23 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tar::{Archive, Builder};
 use tauri::Manager;
 
-const DEFAULT_SERVER_DOMAIN: &str = "https://factory.follow-flow.de";
-const DEFAULT_BOOTSTRAP_API_KEY: &str = "followflow-default-node-key-change-me";
 const GOOGLE_USB_DRIVER_ZIP_URL: &str =
     "https://dl.google.com/android/repository/latest_usb_driver_windows.zip";
 static WINDOWS_DRIVER_INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static LOCAL_PROCESS_RECOVERY_PERFORMED: AtomicBool = AtomicBool::new(false);
 static WORKFLOW_JOB_RUNNING: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(default)]
-struct ClientConfig {
-    server_domain: String,
-    node_uuid: String,
-    node_key: String,
-    api_key: String,
-    bootstrap_api_key: String,
-    environment: String,
-    allow_server_rebind: bool,
-    adb_enabled: bool,
-    adb_device_discovery_enabled: bool,
-    last_successful_server: String,
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            server_domain: DEFAULT_SERVER_DOMAIN.to_string(),
-            node_uuid: format!("node-{}", Utc::now().timestamp_millis()),
-            node_key: format!("local-key-{}", Utc::now().timestamp_millis()),
-            api_key: DEFAULT_BOOTSTRAP_API_KEY.to_string(),
-            bootstrap_api_key: DEFAULT_BOOTSTRAP_API_KEY.to_string(),
-            environment: "production".to_string(),
-            allow_server_rebind: true,
-            adb_enabled: true,
-            adb_device_discovery_enabled: true,
-            last_successful_server: DEFAULT_SERVER_DOMAIN.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct ClientStatus {
     config: ClientConfig,
+    registered: bool,
+    enrollment_credential_available: bool,
     pending_events: i64,
     local_devices: i64,
     adb_source: String,
@@ -74,13 +60,6 @@ struct ClientStatus {
     running_processes: i64,
     cpu_load_percent: Option<f64>,
     updater_available: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct RebindRequest {
-    new_server_domain: String,
-    expires_at: String,
-    signature: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,61 +267,8 @@ fn stage_bundled_tooling_best_effort(app: &tauri::AppHandle) {
     }
 }
 
-fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    Ok(ensure_runtime_dir(app)?.join("client.json"))
-}
-
 fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(ensure_runtime_dir(app)?.join("client_local.db"))
-}
-
-fn load_or_create_config(app: &tauri::AppHandle) -> Result<ClientConfig, String> {
-    let path = config_path(app)?;
-
-    if !path.exists() {
-        let cfg = ClientConfig::default();
-        let content = serde_json::to_string_pretty(&cfg)
-            .map_err(|e| format!("serialize default config failed: {e}"))?;
-        fs::write(&path, content).map_err(|e| format!("write default config failed: {e}"))?;
-        return Ok(cfg);
-    }
-
-    let raw = fs::read_to_string(&path).map_err(|e| format!("read config failed: {e}"))?;
-    let mut cfg: ClientConfig =
-        serde_json::from_str(&raw).map_err(|e| format!("parse config failed: {e}"))?;
-
-    if cfg.bootstrap_api_key.trim().is_empty() {
-        cfg.bootstrap_api_key = DEFAULT_BOOTSTRAP_API_KEY.to_string();
-    }
-
-    if cfg.api_key.trim().is_empty() {
-        cfg.api_key = cfg.bootstrap_api_key.clone();
-    }
-
-    if normalize_config_domains(&mut cfg) {
-        save_config(app, &cfg)?;
-    }
-
-    Ok(cfg)
-}
-
-fn save_config(app: &tauri::AppHandle, cfg: &ClientConfig) -> Result<(), String> {
-    let path = config_path(app)?;
-    let content =
-        serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize config failed: {e}"))?;
-    fs::write(path, content).map_err(|e| format!("save config failed: {e}"))
-}
-
-fn adb_enabled(app: &tauri::AppHandle) -> bool {
-    load_or_create_config(app)
-        .map(|cfg| cfg.adb_enabled)
-        .unwrap_or(true)
-}
-
-fn adb_device_discovery_enabled(app: &tauri::AppHandle) -> bool {
-    load_or_create_config(app)
-        .map(|cfg| cfg.adb_enabled && cfg.adb_device_discovery_enabled)
-        .unwrap_or(true)
 }
 
 fn open_db(app: &tauri::AppHandle) -> Result<Connection, String> {
@@ -460,51 +386,6 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn base_url(domain: &str) -> String {
-    domain.trim().trim_end_matches('/').to_string()
-}
-
-fn canonical_server_domain(input: &str) -> String {
-    let mut domain = base_url(input);
-
-    if domain.is_empty() {
-        return DEFAULT_SERVER_DOMAIN.to_string();
-    }
-
-    if domain.eq_ignore_ascii_case("https://factory.followflow.de") {
-        domain = DEFAULT_SERVER_DOMAIN.to_string();
-    }
-
-    if domain.contains("example.com") {
-        domain = DEFAULT_SERVER_DOMAIN.to_string();
-    }
-
-    domain
-}
-
-fn normalize_config_domains(cfg: &mut ClientConfig) -> bool {
-    let mut changed = false;
-
-    let normalized_server = canonical_server_domain(&cfg.server_domain);
-    if normalized_server != cfg.server_domain {
-        cfg.server_domain = normalized_server;
-        changed = true;
-    }
-
-    if cfg.last_successful_server.trim().is_empty() {
-        cfg.last_successful_server = cfg.server_domain.clone();
-        changed = true;
-    } else {
-        let normalized_last = canonical_server_domain(&cfg.last_successful_server);
-        if normalized_last != cfg.last_successful_server {
-            cfg.last_successful_server = normalized_last;
-            changed = true;
-        }
-    }
-
-    changed
-}
-
 fn preview_body(input: &str, max_chars: usize) -> String {
     let preview: String = input.chars().take(max_chars).collect();
     if input.chars().count() > max_chars {
@@ -517,8 +398,16 @@ fn preview_body(input: &str, max_chars: usize) -> String {
 fn http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(RedirectPolicy::none())
         .build()
         .map_err(|e| format!("http client init failed: {e}"))
+}
+
+fn secret_header_value(secret: &str) -> Result<HeaderValue, String> {
+    let mut value = HeaderValue::from_str(secret)
+        .map_err(|_| "credential is not a valid HTTP header value".to_string())?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 fn queue_local_event(
@@ -1064,13 +953,27 @@ fn register_node_remote_internal(
     node_name: Option<String>,
 ) -> Result<bool, String> {
     let mut cfg = load_or_create_config(app)?;
+    if !cfg.api_key.trim().is_empty() {
+        return Err(
+            "Node is already registered; re-enrollment requires an explicit credential reset"
+                .to_string(),
+        );
+    }
+
+    let register_key = cfg.bootstrap_api_key.trim().to_string();
+    if register_key.is_empty() {
+        return Err(
+            "Missing one-time enrollment credential. Configure it before registering the node."
+                .to_string(),
+        );
+    }
+
     let endpoint = format!(
         "{}/api/client-controller/register-node",
         base_url(&cfg.server_domain)
     );
     let workflow_ready = workflow_runtime_ready(app);
 
-    let register_key = cfg.bootstrap_api_key.clone();
     let adb_capable = cfg.adb_enabled;
     let adb_device_discovery_capable = cfg.adb_enabled && cfg.adb_device_discovery_enabled;
 
@@ -1081,7 +984,6 @@ fn register_node_remote_internal(
         "os": std::env::consts::OS,
         "current_server_domain": cfg.server_domain,
         "last_successful_server_domain": cfg.last_successful_server,
-        "bootstrap_api_key": register_key,
         "capabilities": {
             "android": adb_capable,
             "adb": adb_capable,
@@ -1095,7 +997,7 @@ fn register_node_remote_internal(
             "job_protocol_version": 2,
             "node_execution": true,
             "appium": false,
-            "server_rebind": true,
+            "server_rebind": false,
             "auto_update": true
         }
     });
@@ -1103,8 +1005,7 @@ fn register_node_remote_internal(
     let client = http_client()?;
     let response = client
         .post(&endpoint)
-        .header("X-BOOTSTRAP-API-KEY", register_key.clone())
-        .header("X-NODE-API-KEY", register_key)
+        .header("X-BOOTSTRAP-API-KEY", secret_header_value(&register_key)?)
         .json(&payload)
         .send()
         .map_err(|e| format!("register request failed: {e}"))?;
@@ -1116,31 +1017,20 @@ fn register_node_remote_internal(
 
     if !status_code.is_success() {
         return Err(format!(
-            "register failed: HTTP {} - {}",
-            status_code.as_u16(),
-            preview_body(&raw_body, 500)
+            "register failed with HTTP {}",
+            status_code.as_u16()
         ));
     }
 
-    let body: Value = serde_json::from_str(&raw_body).map_err(|e| {
-        format!(
-            "register response parse failed: {} (HTTP {}, body: {})",
-            e,
-            status_code.as_u16(),
-            preview_body(&raw_body, 500)
-        )
-    })?;
+    let body: Value =
+        serde_json::from_str(&raw_body).map_err(|_| "register response is invalid".to_string())?;
 
     if !body
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return Err(format!(
-            "register failed: HTTP {} - {}",
-            status_code.as_u16(),
-            body
-        ));
+        return Err("register response did not confirm success".to_string());
     }
 
     let api_key = body
@@ -1149,9 +1039,17 @@ fn register_node_remote_internal(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "register response did not contain a node api key".to_string())?;
+
+    if api_key == register_key {
+        return Err("server returned the enrollment credential as node api key".to_string());
+    }
+
+    store_secret(ClientSecret::NodeApiKey, &cfg.node_uuid, api_key)?;
     cfg.api_key = api_key.to_string();
+    cfg.bootstrap_api_key.clear();
     cfg.last_successful_server = cfg.server_domain.clone();
     save_config(app, &cfg)?;
+    delete_secret(ClientSecret::BootstrapApiKey, &cfg.node_uuid)?;
 
     Ok(true)
 }
@@ -1168,6 +1066,18 @@ fn authentication_failed(error: &str) -> bool {
 fn recover_node_registration(app: &tauri::AppHandle, error: &str) -> Result<bool, String> {
     if !authentication_failed(error) {
         return Ok(false);
+    }
+
+    let mut cfg = load_or_create_config(app)?;
+    delete_secret(ClientSecret::NodeApiKey, &cfg.node_uuid)?;
+    cfg.api_key.clear();
+    save_config(app, &cfg)?;
+
+    if cfg.bootstrap_api_key.trim().is_empty() {
+        return Err(
+            "Node authentication was rejected. A new one-time enrollment credential is required."
+                .to_string(),
+        );
     }
 
     register_node_remote_internal(app, None)?;
@@ -1277,7 +1187,6 @@ fn heartbeat_remote_internal(
         "os": std::env::consts::OS,
         "current_server_domain": cfg.server_domain,
         "last_successful_server_domain": cfg.last_successful_server,
-        "api_key": cfg.api_key,
         "capabilities": {
             "android": adb_capable,
             "adb": adb_capable,
@@ -1290,7 +1199,7 @@ fn heartbeat_remote_internal(
             "workflow_bundle_v1": workflow_ready,
             "job_protocol_version": 2,
             "node_execution": true,
-            "server_rebind": true,
+            "server_rebind": false,
             "auto_update": true
         }
     });
@@ -1298,7 +1207,7 @@ fn heartbeat_remote_internal(
     let client = http_client()?;
     let response = client
         .post(&endpoint)
-        .header("X-NODE-API-KEY", cfg.api_key.clone())
+        .header("X-NODE-API-KEY", secret_header_value(&cfg.api_key)?)
         .json(&body)
         .send()
         .map_err(|e| format!("heartbeat request failed: {e}"))?;
@@ -1456,7 +1365,6 @@ fn sync_devices_remote_internal(app: &tauri::AppHandle) -> Result<usize, String>
     );
 
     let payload = json!({
-        "api_key": cfg.api_key,
         "devices": local_devices.iter().map(|d| json!({
             "name": d.name,
             "platform": d.platform,
@@ -1472,7 +1380,7 @@ fn sync_devices_remote_internal(app: &tauri::AppHandle) -> Result<usize, String>
     let client = http_client()?;
     let response = client
         .post(&endpoint)
-        .header("X-NODE-API-KEY", cfg.api_key)
+        .header("X-NODE-API-KEY", secret_header_value(&cfg.api_key)?)
         .json(&payload)
         .send()
         .map_err(|e| format!("sync-devices request failed: {e}"))?;
@@ -1970,7 +1878,6 @@ fn report_job_result_remote(
         json!({ "value": result })
     };
     let body = json!({
-        "api_key": cfg.api_key,
         "job_uuid": job_uuid,
         "status": status,
         "result": result,
@@ -1980,7 +1887,7 @@ fn report_job_result_remote(
     });
     let response = http_client()?
         .post(endpoint)
-        .header("X-NODE-API-KEY", cfg.api_key)
+        .header("X-NODE-API-KEY", secret_header_value(&cfg.api_key)?)
         .json(&body)
         .send()
         .map_err(|e| format!("job result request failed: {e}"))?;
@@ -2045,7 +1952,7 @@ fn report_job_progress_remote(
 
     let response = http_client()?
         .post(endpoint)
-        .header("X-NODE-API-KEY", cfg.api_key)
+        .header("X-NODE-API-KEY", secret_header_value(&cfg.api_key)?)
         .multipart(form)
         .send()
         .map_err(|e| format!("job progress request failed: {e}"))?;
@@ -3576,15 +3483,15 @@ fn workflow_step_route(step: &Value, result: &Value, outcome: &str) -> Value {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let task_key = if outcome == "success" {
-        route_requested
-            .then(|| {
-                result
-                    .get("completedTaskKey")
-                    .or_else(|| result.get("completed_task_key"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-            })
-            .unwrap_or("")
+        if route_requested {
+            result
+                .get("completedTaskKey")
+                .or_else(|| result.get("completed_task_key"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        } else {
+            ""
+        }
     } else {
         result
             .get("failedTaskKey")
@@ -4449,6 +4356,9 @@ fn pull_and_start_jobs_remote_internal(app: &tauri::AppHandle) -> Result<usize, 
     }
 
     let cfg = load_or_create_config(app)?;
+    if cfg.api_key.trim().is_empty() {
+        return Err("Missing api_key. Register node first.".to_string());
+    }
     let endpoint = format!(
         "{}/api/client-controller/pull-jobs",
         base_url(&cfg.server_domain)
@@ -4456,9 +4366,8 @@ fn pull_and_start_jobs_remote_internal(app: &tauri::AppHandle) -> Result<usize, 
     let resume_job_uuids = interrupted_workflow_job_ids(app)?;
     let response = http_client()?
         .post(endpoint)
-        .header("X-NODE-API-KEY", cfg.api_key.clone())
+        .header("X-NODE-API-KEY", secret_header_value(&cfg.api_key)?)
         .json(&json!({
-            "api_key": cfg.api_key,
             "protocol_version": 2,
             "resume_job_uuids": resume_job_uuids,
         }))
@@ -4493,6 +4402,119 @@ fn pull_and_start_jobs_remote_internal(app: &tauri::AppHandle) -> Result<usize, 
     }
 
     Ok(count)
+}
+
+fn signal_job_polling_best_effort(app: &tauri::AppHandle) {
+    if let Some(doorbell) = app.try_state::<JobPollDoorbell>() {
+        let _ = doorbell.signal();
+    }
+}
+
+fn pull_jobs_after_doorbell(app: &tauri::AppHandle) {
+    match pull_and_start_jobs_remote_internal(app) {
+        Ok(_) => {}
+        Err(error) => match recover_node_registration(app, &error) {
+            Ok(true) => {
+                if let Err(retry_error) = pull_and_start_jobs_remote_internal(app) {
+                    let _ = queue_local_event(
+                        app,
+                        "pull_jobs_failed",
+                        json!({
+                            "error": retry_error,
+                            "after_reregister": true,
+                            "source": "job-doorbell",
+                        }),
+                    );
+                }
+            }
+            Ok(false) => {
+                let _ = queue_local_event(
+                    app,
+                    "pull_jobs_failed",
+                    json!({ "error": error, "source": "job-doorbell" }),
+                );
+            }
+            Err(recovery_error) => {
+                let _ = queue_local_event(
+                    app,
+                    "pull_jobs_failed",
+                    json!({
+                        "error": recovery_error,
+                        "trigger": error,
+                        "source": "job-doorbell",
+                    }),
+                );
+            }
+        },
+    }
+}
+
+fn run_autopilot_worker(app: tauri::AppHandle, receiver: Receiver<()>) {
+    let _ = bootstrap_local_runtime(app.clone());
+    let mut next_watchdog = Instant::now();
+
+    loop {
+        let wait = next_watchdog.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(wait) {
+            Ok(()) => pull_jobs_after_doorbell(&app),
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = autopilot_cycle_internal(&app);
+                next_watchdog = Instant::now() + AUTOPILOT_WATCHDOG_INTERVAL;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn realtime_jitter_seed(attempt: u32) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or_default()
+        ^ u64::from(attempt).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+fn run_realtime_listener(app: tauri::AppHandle) {
+    let mut attempt = 0_u32;
+
+    loop {
+        let session = load_or_create_config(&app).and_then(|cfg| {
+            if cfg.api_key.trim().is_empty() {
+                return Err("realtime listener is waiting for node enrollment".to_string());
+            }
+
+            let credentials =
+                RealtimeCredentials::new(cfg.server_domain, cfg.node_uuid, cfg.api_key);
+            listen_realtime_once(&credentials, || {
+                let doorbell = app
+                    .try_state::<JobPollDoorbell>()
+                    .ok_or_else(|| "job polling worker is not available".to_string())?;
+                doorbell.signal().map(|_| ())
+            })
+        });
+
+        let delay = match session {
+            Ok(SessionOutcome::Disabled) => {
+                attempt = 0;
+                AUTOPILOT_WATCHDOG_INTERVAL
+            }
+            Ok(SessionOutcome::Disconnected { established }) => {
+                if established {
+                    attempt = 0;
+                }
+                let delay = reconnect_delay(attempt, realtime_jitter_seed(attempt));
+                attempt = attempt.saturating_add(1);
+                delay
+            }
+            Err(_) => {
+                let delay = reconnect_delay(attempt, realtime_jitter_seed(attempt));
+                attempt = attempt.saturating_add(1);
+                delay
+            }
+        };
+
+        std::thread::sleep(delay);
+    }
 }
 
 fn autopilot_cycle_internal(app: &tauri::AppHandle) -> Result<SyncSummary, String> {
@@ -4743,6 +4765,8 @@ fn bootstrap_local_runtime(app: tauri::AppHandle) -> Result<GenericResult, Strin
 #[tauri::command]
 fn get_client_status(app: tauri::AppHandle) -> Result<ClientStatus, String> {
     let cfg = load_or_create_config(&app)?;
+    let registered = !cfg.api_key.trim().is_empty();
+    let enrollment_credential_available = !cfg.bootstrap_api_key.trim().is_empty();
     init_db(&app)?;
 
     let conn = open_db(&app)?;
@@ -4775,6 +4799,8 @@ fn get_client_status(app: tauri::AppHandle) -> Result<ClientStatus, String> {
 
     Ok(ClientStatus {
         config: cfg,
+        registered,
+        enrollment_credential_available,
         pending_events,
         local_devices,
         adb_source,
@@ -4823,7 +4849,17 @@ fn update_server_domain(
     server_domain: String,
 ) -> Result<GenericResult, String> {
     let mut cfg = load_or_create_config(&app)?;
-    let normalized = canonical_server_domain(&server_domain);
+    let normalized = validated_server_domain(&server_domain)?;
+    let binding_changed = normalized != cfg.server_domain;
+
+    if binding_changed {
+        delete_secret(ClientSecret::NodeApiKey, &cfg.node_uuid)?;
+        delete_secret(ClientSecret::BootstrapApiKey, &cfg.node_uuid)?;
+        cfg.api_key.clear();
+        cfg.bootstrap_api_key.clear();
+        cfg.last_successful_server = cfg.server_domain.clone();
+    }
+
     cfg.server_domain = normalized.clone();
 
     if cfg.last_successful_server.trim().is_empty() {
@@ -4834,7 +4870,13 @@ fn update_server_domain(
 
     Ok(GenericResult {
         success: true,
-        message: format!("server_domain updated to {normalized}"),
+        message: if binding_changed {
+            format!(
+                "server_domain updated to {normalized}; previous node credentials were discarded"
+            )
+        } else {
+            format!("server_domain remains {normalized}")
+        },
     })
 }
 
@@ -4856,6 +4898,38 @@ fn update_adb_settings(
         } else {
             "ADB-Steuerung deaktiviert.".to_string()
         },
+    })
+}
+
+#[tauri::command]
+fn configure_bootstrap_credential(
+    app: tauri::AppHandle,
+    bootstrap_api_key: String,
+) -> Result<GenericResult, String> {
+    let mut cfg = load_or_create_config(&app)?;
+    if !cfg.api_key.trim().is_empty() {
+        return Err(
+            "Node is already registered; the enrollment credential cannot be replaced".to_string(),
+        );
+    }
+
+    let credential = bootstrap_api_key.trim();
+    if credential.len() < 32 || credential.len() > 4096 {
+        return Err(
+            "Enrollment credential must contain between 32 and 4096 characters".to_string(),
+        );
+    }
+    if credential.chars().any(char::is_control) {
+        return Err("Enrollment credential must not contain control characters".to_string());
+    }
+
+    store_secret(ClientSecret::BootstrapApiKey, &cfg.node_uuid, credential)?;
+    cfg.bootstrap_api_key = credential.to_string();
+    save_config(&app, &cfg)?;
+
+    Ok(GenericResult {
+        success: true,
+        message: "One-time enrollment credential stored in Windows Credential Manager".to_string(),
     })
 }
 
@@ -4936,7 +5010,6 @@ fn mark_event_sent(app: tauri::AppHandle, event_id: i64) -> Result<GenericResult
     })
 }
 
-#[tauri::command]
 fn log_heartbeat_local(
     app: tauri::AppHandle,
     status: String,
@@ -4962,90 +5035,18 @@ fn log_heartbeat_local(
 }
 
 #[tauri::command]
-fn apply_rebind_request(
-    app: tauri::AppHandle,
-    request: RebindRequest,
-) -> Result<GenericResult, String> {
-    let mut cfg = load_or_create_config(&app)?;
-    init_db(&app)?;
-    let conn = open_db(&app)?;
-
-    let old_server = cfg.server_domain.clone();
-    let normalized_new_server = canonical_server_domain(&request.new_server_domain);
-
-    if !cfg.allow_server_rebind {
-        conn.execute(
-            "INSERT INTO rebind_logs_local (old_server_domain, new_server_domain, status, reason, created_at)
-             VALUES (?1, ?2, 'rejected', ?3, ?4)",
-            params![old_server, normalized_new_server, "allow_server_rebind=false", now_iso()],
-        )
-        .map_err(|e| format!("log rejected rebind failed: {e}"))?;
-
-        return Ok(GenericResult {
-            success: false,
-            message: "Rebind blocked: allow_server_rebind=false".to_string(),
-        });
-    }
-
-    if request.signature.trim().is_empty() {
-        conn.execute(
-            "INSERT INTO rebind_logs_local (old_server_domain, new_server_domain, status, reason, created_at)
-             VALUES (?1, ?2, 'rejected', ?3, ?4)",
-            params![old_server, normalized_new_server, "missing signature", now_iso()],
-        )
-        .map_err(|e| format!("log rejected rebind failed: {e}"))?;
-
-        return Ok(GenericResult {
-            success: false,
-            message: "Rebind blocked: missing signature".to_string(),
-        });
-    }
-
-    let expires = DateTime::parse_from_rfc3339(&request.expires_at)
-        .map_err(|e| format!("invalid expires_at format (RFC3339 expected): {e}"))?
-        .with_timezone(&Utc);
-
-    if Utc::now() > expires {
-        conn.execute(
-            "INSERT INTO rebind_logs_local (old_server_domain, new_server_domain, status, reason, created_at)
-             VALUES (?1, ?2, 'rejected', ?3, ?4)",
-            params![old_server, normalized_new_server, "request expired", now_iso()],
-        )
-        .map_err(|e| format!("log expired rebind failed: {e}"))?;
-
-        return Ok(GenericResult {
-            success: false,
-            message: "Rebind blocked: request expired".to_string(),
-        });
-    }
-
-    cfg.last_successful_server = cfg.server_domain.clone();
-    cfg.server_domain = normalized_new_server.clone();
-    save_config(&app, &cfg)?;
-
-    conn.execute(
-        "INSERT INTO rebind_logs_local (old_server_domain, new_server_domain, status, reason, created_at)
-         VALUES (?1, ?2, 'applied', ?3, ?4)",
-        params![old_server, normalized_new_server, "applied (mvp)", now_iso()],
-    )
-    .map_err(|e| format!("log successful rebind failed: {e}"))?;
-
-    Ok(GenericResult {
-        success: true,
-        message: "Rebind applied (MVP validation)".to_string(),
-    })
-}
-
-#[tauri::command]
 fn register_node_remote(
     app: tauri::AppHandle,
     node_name: Option<String>,
 ) -> Result<GenericResult, String> {
     match register_node_remote_internal(&app, node_name) {
-        Ok(_) => Ok(GenericResult {
-            success: true,
-            message: "Node successfully registered on server".to_string(),
-        }),
+        Ok(_) => {
+            signal_job_polling_best_effort(&app);
+            Ok(GenericResult {
+                success: true,
+                message: "Node successfully registered on server".to_string(),
+            })
+        }
         Err(err) => {
             let _ = queue_local_event(
                 &app,
@@ -5089,17 +5090,6 @@ fn discover_android_devices(app: tauri::AppHandle) -> Result<Vec<LocalDevice>, S
 }
 
 #[tauri::command]
-fn install_windows_usb_driver(app: tauri::AppHandle) -> Result<GenericResult, String> {
-    match try_install_windows_usb_driver_best_effort(&app) {
-        Ok(msg) => Ok(GenericResult {
-            success: true,
-            message: msg,
-        }),
-        Err(err) => Err(err),
-    }
-}
-
-#[tauri::command]
 fn get_local_devices(app: tauri::AppHandle) -> Result<Vec<LocalDevice>, String> {
     load_local_devices_internal(&app)
 }
@@ -5123,27 +5113,18 @@ fn run_autopilot_cycle(app: tauri::AppHandle) -> Result<SyncSummary, String> {
     autopilot_cycle_internal(&app)
 }
 
-#[tauri::command]
-fn run_full_sync(app: tauri::AppHandle) -> Result<SyncSummary, String> {
-    autopilot_cycle_internal(&app)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let (job_poll_doorbell, job_poll_receiver) = create_job_poll_doorbell();
     let app = tauri::Builder::default()
-        .setup(|app| {
+        .manage(job_poll_doorbell)
+        .setup(move |app| {
             let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let _ = bootstrap_local_runtime(handle.clone());
-
-                loop {
-                    let _ = autopilot_cycle_internal(&handle);
-                    std::thread::sleep(Duration::from_secs(30));
-                }
-            });
+            std::thread::spawn(move || run_autopilot_worker(handle, job_poll_receiver));
+            let realtime_handle = app.handle().clone();
+            std::thread::spawn(move || run_realtime_listener(realtime_handle));
             Ok(())
         })
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             bootstrap_local_runtime,
             get_client_status,
@@ -5152,19 +5133,16 @@ pub fn run() {
             export_workflow_process_debug,
             update_server_domain,
             update_adb_settings,
+            configure_bootstrap_credential,
             queue_event_local,
             get_pending_events,
             mark_event_sent,
-            log_heartbeat_local,
-            apply_rebind_request,
             register_node_remote,
             send_heartbeat_remote,
             discover_android_devices,
-            install_windows_usb_driver,
             get_local_devices,
             sync_devices_remote,
             run_autopilot_cycle,
-            run_full_sync,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

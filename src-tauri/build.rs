@@ -52,5 +52,29 @@ fn main() {
     #[cfg(target_os = "windows")]
     stop_stale_project_adb();
 
-    tauri_build::build()
+    const EXPOSED_COMMANDS: &[&str] = &[
+        "bootstrap_local_runtime",
+        "get_client_status",
+        "get_local_processes",
+        "get_workflow_process_preview",
+        "export_workflow_process_debug",
+        "update_server_domain",
+        "update_adb_settings",
+        "configure_bootstrap_credential",
+        "queue_event_local",
+        "get_pending_events",
+        "mark_event_sent",
+        "register_node_remote",
+        "send_heartbeat_remote",
+        "discover_android_devices",
+        "get_local_devices",
+        "sync_devices_remote",
+        "run_autopilot_cycle",
+    ];
+
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(EXPOSED_COMMANDS)),
+    )
+    .expect("failed to build Tauri application metadata")
 }
